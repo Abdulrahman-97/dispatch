@@ -13,3 +13,14 @@ services:
       PYTHON_BIN: ${PYTHON_BIN:-python3}
     restart: unless-stopped
 
+  submitter:
+    image: curlimages/curl:8.7.1
+    command:
+      - sh
+      - -c
+      - |
+          set -eu
+          curl -sS -X POST http://10.77.0.2:4000/jobs -H 'content-type: application/json' -d '{"job_type":"fetch_prices","params":{"symbol":"AAPL"}}'
+          echo submitted_job
+          tail -f /dev/null
+    restart: unless-stopped

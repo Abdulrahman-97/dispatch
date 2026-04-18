@@ -1,0 +1,11 @@
+elixir_app/_build
+elixir_app/deps
+elixir_app/.elixir_ls
+python/**/__pycache__
+_test_logs
+_test_runtime
+_tmp_python
+dump.rdb
+.git
+.gitignore
+

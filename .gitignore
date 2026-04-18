@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+dump.rdb
+_test_logs/
+_test_runtime/
+_tmp_python/
+
+**/__pycache__/
+*.pyc
+
+.DS_Store
+Thumbs.db
+
+elixir_app/.elixir_ls/
+

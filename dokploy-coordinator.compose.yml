@@ -20,9 +20,8 @@ services:
       PORT: 4000
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     ports:
-      - "4000:4000"
+      - "${COORDINATOR_BIND_IP:-0.0.0.0}:4000:4000"
     restart: unless-stopped
 
 volumes:
   redis-data:
-

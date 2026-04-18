@@ -146,13 +146,17 @@ This stack runs:
 Recommended environment values:
 
 - `REDIS_URL=redis://redis:6379/0`
+- `COORDINATOR_BIND_IP=10.77.0.2`
 
 Expose the coordinator either:
 
 - through a Dokploy domain such as `https://dispatch.example.com`, or
 - directly on the server IP and port, such as `http://10.0.0.12:4000`
 
-Use that same URL everywhere else as the coordinator URL.
+Use that same URL everywhere else as the coordinator URL. With private networking, the intended setup is:
+
+- bind the coordinator on `10.77.0.2:4000`
+- point workers and Dagster at `http://10.77.0.2:4000`
 
 ### 2. Deploy the worker on the second server
 
@@ -188,10 +192,18 @@ If you want to drive the rollout through the Dokploy API instead of the UI:
 2. Fill in:
    - `DOKPLOY_BASE_URL`
    - `DOKPLOY_API_KEY`
-   - `DOKPLOY_ENVIRONMENT_ID`
+   - `DOKPLOY_COORDINATOR_PROJECT_NAME`
+   - `DOKPLOY_COORDINATOR_ENVIRONMENT_NAME`
+   - `DOKPLOY_COORDINATOR_ENVIRONMENT_ID`
    - `DOKPLOY_COORDINATOR_SERVER_ID`
+   - `DOKPLOY_WORKER_PROJECT_NAME`
+   - `DOKPLOY_WORKER_ENVIRONMENT_NAME`
+   - `DOKPLOY_WORKER_ENVIRONMENT_ID`
    - `DOKPLOY_WORKER_SERVER_ID`
-   - `DISPATCH_COORDINATOR_PUBLIC_URL`
+   - `DISPATCH_COORDINATOR_URL`
+   - `COORDINATOR_BIND_IP`
+   - `DOKPLOY_GIT_URL`
+   - `DOKPLOY_GIT_BRANCH`
 3. Run:
 
 ```powershell
@@ -200,10 +212,18 @@ python .\python\tools\dokploy_deploy.py
 
 The script:
 
-- creates or updates the coordinator compose service
-- creates or updates the worker compose service
+- creates or updates the coordinator compose service in the existing Dagster project
+- creates the worker project and production environment if they do not exist yet
+- creates or updates the worker compose service in that separate worker project
 - saves the environment variables for each compose service
 - triggers deployment for both services
+
+For private-network deployment, set:
+
+- `DISPATCH_COORDINATOR_URL=http://<dagster-private-ip>:4000`
+- `COORDINATOR_BIND_IP=<dagster-private-ip>`
+
+The worker service will use that private address to poll the coordinator.
 
 It uses Dokploy's current API flow around `compose.create`, `compose.update`, `compose.saveEnvironment`, and `compose.deploy`:
 

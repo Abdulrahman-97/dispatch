@@ -37,7 +37,7 @@ defmodule Dispatch.Application do
   defp worker_children do
     1..worker_concurrency()
     |> Enum.map(fn slot ->
-      {Dispatch.Worker.Poller, [slot: slot]}
+      Supervisor.child_spec({Dispatch.Worker.Poller, [slot: slot]}, id: {Dispatch.Worker.Poller, slot})
     end)
   end
 

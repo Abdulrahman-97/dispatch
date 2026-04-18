@@ -12,30 +12,3 @@ services:
       PYTHON_ROOT: /app/python
       PYTHON_BIN: ${PYTHON_BIN:-python3}
     restart: unless-stopped
-
-  submitter:
-    image: curlimages/curl:8.7.1
-    command:
-      - sh
-      - -c
-      - |
-          set -eu
-          response="$(curl -sS -X POST http://10.77.0.2:4000/jobs -H 'content-type: application/json' -d '{"job_type":"fetch_prices","params":{"symbol":"AAPL"}}')"
-          echo "submit_response=$response"
-          job_id="$(printf '%s' "$response" | sed -n 's/.*\"job_id\":\"\\([^\"]*\\)\".*/\\1/p')"
-          test -n "$job_id"
-          echo "job_id=$job_id"
-          i=0
-          while [ "$i" -lt 60 ]; do
-            status_response="$(curl -sS "http://10.77.0.2:4000/jobs/$job_id")"
-            echo "status_response=$status_response"
-            case "$status_response" in
-              *'"status":"success"'*|*'"status":"failed"'*)
-                break
-                ;;
-            esac
-            i=$((i + 1))
-            sleep 1
-          done
-          tail -f /dev/null
-    restart: unless-stopped

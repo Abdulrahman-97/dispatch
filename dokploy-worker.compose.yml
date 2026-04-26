@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        STOCKS_PACKAGE_SPEC: ${STOCKS_PACKAGE_SPEC:-}
     environment:
       APP_ROLE: worker
       COORDINATOR_URL: ${COORDINATOR_URL}
@@ -10,5 +12,14 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
       WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
       PYTHON_ROOT: /app/python
-      PYTHON_BIN: ${PYTHON_BIN:-python3}
+      PYTHON_BIN: ${PYTHON_BIN:-/opt/dispatch-python/bin/python}
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      API_KEY: ${API_KEY:-}
+      BUCKET_NAME: ${BUCKET_NAME:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-}
     restart: unless-stopped

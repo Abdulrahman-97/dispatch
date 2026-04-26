@@ -314,16 +314,46 @@ def build_worker_env() -> str:
     worker_name = os.environ.get("DISPATCH_WORKER_NAME", "worker-server-1")
     worker_concurrency = os.environ.get("DISPATCH_WORKER_CONCURRENCY", "5")
     poll_interval = os.environ.get("DISPATCH_WORKER_POLL_INTERVAL_MS", "1000")
+    python_bin = os.environ.get("DISPATCH_WORKER_PYTHON_BIN", "/opt/dispatch-python/bin/python")
 
-    return "\n".join(
-        [
-            f"COORDINATOR_URL={coordinator_url}",
-            f"WORKER_NAME={worker_name}",
-            f"WORKER_CONCURRENCY={worker_concurrency}",
-            f"WORKER_POLL_INTERVAL_MS={poll_interval}",
-            "",
-        ]
+    lines = [
+        f"COORDINATOR_URL={coordinator_url}",
+        f"WORKER_NAME={worker_name}",
+        f"WORKER_CONCURRENCY={worker_concurrency}",
+        f"WORKER_POLL_INTERVAL_MS={poll_interval}",
+        f"PYTHON_BIN={python_bin}",
+    ]
+
+    lines.extend(
+        optional_env_lines(
+            [
+                "STOCKS_PACKAGE_SPEC",
+                "FMP_API_KEY",
+                "API_KEY",
+                "BUCKET_NAME",
+                "S3_BUCKET",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+            ]
+        )
     )
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def optional_env_lines(names: list[str]) -> list[str]:
+    lines = []
+
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value != "":
+            lines.append(f"{name}={value}")
+
+    return lines
 
 
 def required_env(name: str) -> str:

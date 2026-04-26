@@ -110,6 +110,36 @@ The Python script exits non-zero and writes to stderr, and the coordinator store
 - `status: failed`
 - `error: intentional failure for testing`
 
+## Generic Python Callable Jobs
+
+Dispatch supports one generic callable job type:
+
+- `job_type`: `python_callable`
+- `params.callable`: an allowlisted alias
+- `params.kwargs`: JSON object passed to the callable as keyword arguments
+
+Dispatch does not accept arbitrary module paths over HTTP. The alias allowlist lives in
+`python/scripts/python_callable.py`.
+
+Current allowlist:
+
+```text
+stocks_tickers_daily_landing -> stocks.defs.tickers_daily.tickers_daily_new:run_tickers_daily_landing_from_env
+```
+
+Example request:
+
+```powershell
+curl.exe -X POST http://localhost:4000/jobs `
+  -H "content-type: application/json" `
+  -d "{\"job_type\":\"python_callable\",\"params\":{\"callable\":\"stocks_tickers_daily_landing\",\"kwargs\":{\"partition_date\":\"2026-04-24\"}}}"
+```
+
+The callable must return a JSON-serializable object. The worker prints that object to stdout,
+and the coordinator stores it in `result`. If import, validation, or callable execution fails,
+the worker writes a concise error to stderr, exits non-zero, and Dispatch stores the job as
+`failed`.
+
 ## Recovery Behavior
 
 - A worker claim moves the job from `jobs:queue` to `jobs:processing` with Redis `BRPOPLPUSH`
@@ -172,6 +202,19 @@ Useful worker settings:
 - `WORKER_NAME=worker-server-1`
 - `WORKER_CONCURRENCY=5`
 - `WORKER_POLL_INTERVAL_MS=1000`
+- `PYTHON_BIN=/opt/dispatch-python/bin/python`
+
+To run Dagster/stocks callables, the worker image must install the stocks package at build time.
+For the current Dagster/stocks repo layout, set:
+
+- `STOCKS_PACKAGE_SPEC=git+https://github.com/Abdulrahman-97/dagster-stocks.git#subdirectory=stocks`
+
+For the first real landing workload, the worker runtime also needs:
+
+- `FMP_API_KEY` or `API_KEY`
+- `BUCKET_NAME` or `S3_BUCKET`
+- AWS credentials or role permissions for S3 writes
+- optional AWS region values such as `AWS_REGION` or `AWS_DEFAULT_REGION`
 
 The worker no longer needs direct Redis access. It only needs reachability to the coordinator URL.
 

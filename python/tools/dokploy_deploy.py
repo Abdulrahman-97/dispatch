@@ -330,15 +330,6 @@ def build_worker_env() -> str:
                 "PYTHON_PACKAGE_SPEC",
                 "DISPATCH_CALLABLE_ALLOWLIST_FILE",
                 "DISPATCH_CALLABLE_ALLOWLIST_JSON",
-                "FMP_API_KEY",
-                "API_KEY",
-                "BUCKET_NAME",
-                "S3_BUCKET",
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_SESSION_TOKEN",
-                "AWS_REGION",
-                "AWS_DEFAULT_REGION",
             ]
         )
     )

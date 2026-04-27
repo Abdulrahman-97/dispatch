@@ -1,56 +1,163 @@
-# Minimal Distributed Job Execution MVP
+# Dispatch
 
-This repo contains a small Redis-backed job execution system:
+Dispatch is a small Redis-backed job execution system for running Python work on remote worker
+servers.
 
-- `elixir_app/`: coordinator API plus worker runtime
-- `python/scripts/`: Python jobs executed by worker nodes
-- `python/dagster_dispatch/`: thin Dagster-side client and resource for calling the coordinator
+It is intentionally not Kubernetes, not a scheduler, and not a workflow engine. The intended use is
+to let an existing orchestrator, such as Dagster, submit expensive units of work over HTTP while
+Dispatch handles queueing, worker pickup, execution, result capture, and stuck-job recovery.
 
-The public API is unchanged. The reliability changes are internal:
+## Architecture
 
-- job claims move through `jobs:processing` before execution
-- jobs carry `inserted_at`, `started_at`, and `finished_at`
-- the coordinator requeues stuck `running` jobs automatically
+- `coordinator`: Elixir HTTP API that stores job state in Redis
+- `worker`: Elixir poller that claims jobs from the coordinator and runs Python
+- `redis`: shared queue and job state store
+- `python/scripts`: executable Python job entrypoints
+- `python/dagster_dispatch`: optional Dagster client/resource helper
+
+Workers use a pull model. You can add capacity by running more worker services pointed at the same
+coordinator.
 
 ## What It Does
 
-- `POST /jobs` queues a job in Redis
-- `POST /internal/poll` lets a worker atomically claim the next job
-- the worker executes `python/scripts/<job_type>.py`
-- `POST /internal/result` stores the final `success` or `failed` state
-- `GET /jobs/:id` returns the current status
+- `POST /jobs` queues a job
+- `POST /internal/poll` lets a worker atomically claim a job
+- workers execute `python/scripts/<job_type>.py`
+- `POST /internal/result` stores `success` or `failed`
+- `GET /jobs/:id` returns the current job status
+- stuck `running` jobs are recovered back to the queue
 
-## Requirements
+## Non-Goals
 
-- Elixir 1.19+
-- Erlang/OTP 28+
-- Python 3.11+
-- Redis reachable by the coordinator at `REDIS_URL`
+- no scheduling
+- no autoscaling
+- no UI
+- no distributed locking service
+- no authentication in the MVP
+- no secret management
+- no custom Dagster executor or run launcher
 
-## Config
+Do not expose the coordinator publicly without adding authentication and network controls.
 
-- `APP_ROLE`: `coordinator` or `worker`
-- `REDIS_URL`: Redis connection string for the coordinator, default `redis://localhost:6379/0`
-- `PORT`: coordinator port, default `4000`
-- `COORDINATOR_URL`: worker target, default `http://localhost:4000`
-- `WORKER_CONCURRENCY`: poller count per worker node, default `5`
-- `WORKER_POLL_INTERVAL_MS`: sleep when the queue is empty, default `1000`
-- `WORKER_NAME`: optional log label for a worker node
-- `PYTHON_ROOT`: worker path to the Python directory, default `../python`
-- `PYTHON_BIN`: Python executable. If unset, the worker tries `python`, then `python3`
+## API
 
-## Local Run
+Submit a job:
 
-1. Start Redis on `localhost:6379`.
+```http
+POST /jobs
+content-type: application/json
 
-2. Install Elixir dependencies:
+{
+  "job_type": "fetch_prices",
+  "params": {
+    "symbol": "AAPL"
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "uuid"
+}
+```
+
+Get job status:
+
+```http
+GET /jobs/:id
+```
+
+Response:
+
+```json
+{
+  "job_id": "uuid",
+  "status": "queued | running | success | failed",
+  "result": "...",
+  "error": "..."
+}
+```
+
+Worker endpoints:
+
+- `POST /internal/poll`
+- `POST /internal/result`
+
+Those are intended for workers only.
+
+## Job Lifecycle
+
+Redis keys:
+
+- `jobs:queue`: queued job ids
+- `jobs:processing`: claimed job ids currently running
+- `job:{id}`: job hash containing status, payload, result, error, and timestamps
+
+State flow:
+
+```text
+queued -> running -> success | failed
+```
+
+Reliability behavior:
+
+- jobs are claimed with `BRPOPLPUSH jobs:queue jobs:processing 0`
+- completed jobs are removed from `jobs:processing` with `LREM`
+- job hashes include `inserted_at`, `started_at`, and `finished_at`
+- the coordinator periodically requeues stuck `running` jobs
+- stale worker results are rejected if a job was already recovered and restarted
+
+## Configuration
+
+Coordinator:
+
+```env
+APP_ROLE=coordinator
+REDIS_URL=redis://localhost:6379/0
+PORT=4000
+```
+
+Worker:
+
+```env
+APP_ROLE=worker
+COORDINATOR_URL=http://localhost:4000
+WORKER_NAME=worker-1
+WORKER_CONCURRENCY=5
+WORKER_POLL_INTERVAL_MS=1000
+PYTHON_ROOT=/app/python
+PYTHON_BIN=/opt/dispatch-python/bin/python
+```
+
+Generic callable runner:
+
+```env
+DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json
+DISPATCH_CALLABLE_ALLOWLIST_JSON={"example_job":"my_project.jobs:run_example_job"}
+```
+
+Allowlist loading order:
+
+1. `DISPATCH_CALLABLE_ALLOWLIST_FILE`
+2. `DISPATCH_CALLABLE_ALLOWLIST_JSON`
+3. clear failure if neither is set
+
+Use the JSON env form for quick tests. Prefer the file form for real deployments.
+
+## Local Quickstart
+
+Start Redis on `localhost:6379`.
+
+Install Elixir dependencies:
 
 ```powershell
 Set-Location .\elixir_app
 mix deps.get
 ```
 
-3. Start the coordinator:
+Start the coordinator:
 
 ```powershell
 $env:APP_ROLE = "coordinator"
@@ -59,29 +166,18 @@ $env:PORT = "4000"
 mix run --no-halt
 ```
 
-4. Start worker node A in a second shell:
+Start a worker in another shell:
 
 ```powershell
 Set-Location .\elixir_app
 $env:APP_ROLE = "worker"
 $env:COORDINATOR_URL = "http://localhost:4000"
 $env:WORKER_NAME = "worker-a"
-$env:WORKER_CONCURRENCY = "1"
+$env:WORKER_CONCURRENCY = "2"
 mix run --no-halt
 ```
 
-5. Start worker node B in a third shell:
-
-```powershell
-Set-Location .\elixir_app
-$env:APP_ROLE = "worker"
-$env:COORDINATOR_URL = "http://localhost:4000"
-$env:WORKER_NAME = "worker-b"
-$env:WORKER_CONCURRENCY = "1"
-mix run --no-halt
-```
-
-6. Submit a job:
+Submit the bundled demo job:
 
 ```powershell
 curl.exe -X POST http://localhost:4000/jobs `
@@ -89,15 +185,13 @@ curl.exe -X POST http://localhost:4000/jobs `
   -d "{\"job_type\":\"fetch_prices\",\"params\":{\"symbol\":\"AAPL\"}}"
 ```
 
-7. Check the job status:
+Check status:
 
 ```powershell
-curl.exe http://localhost:4000/jobs/<uuid>
+curl.exe http://localhost:4000/jobs/<job_id>
 ```
 
-## Failure Flow
-
-Submit this job to verify the `failed` state:
+Failure test:
 
 ```powershell
 curl.exe -X POST http://localhost:4000/jobs `
@@ -105,31 +199,47 @@ curl.exe -X POST http://localhost:4000/jobs `
   -d "{\"job_type\":\"fetch_prices\",\"params\":{\"symbol\":\"FAIL\"}}"
 ```
 
-The Python script exits non-zero and writes to stderr, and the coordinator stores:
+## Python Job Scripts
 
-- `status: failed`
-- `error: intentional failure for testing`
+Any script in `python/scripts` can be called by its filename:
+
+```text
+python/scripts/fetch_prices.py -> job_type: fetch_prices
+```
+
+The worker runs:
+
+```text
+python scripts/<job_type>.py <params-json>
+```
+
+Expected behavior:
+
+- write the job result to stdout
+- write errors to stderr
+- exit `0` for success
+- exit non-zero for failure
 
 ## Generic Python Callable Jobs
 
-Dispatch supports one generic callable job type:
+For reusable deployments, prefer the generic callable runner instead of adding a Dispatch script for
+every job.
 
-- `job_type`: `python_callable`
-- `params.callable`: an allowlisted alias
-- `params.kwargs`: JSON object passed to the callable as keyword arguments
+Request:
 
-Dispatch does not accept arbitrary module paths over HTTP. The alias allowlist lives on the
-worker as either `DISPATCH_CALLABLE_ALLOWLIST_FILE` or `DISPATCH_CALLABLE_ALLOWLIST_JSON`.
-File-based allowlists are preferred for project-specific worker images. Allowlist values use
-`module:function` format.
+```json
+{
+  "job_type": "python_callable",
+  "params": {
+    "callable": "example_job",
+    "kwargs": {
+      "partition_date": "2026-04-24"
+    }
+  }
+}
+```
 
-Allowlist loading order:
-
-1. `DISPATCH_CALLABLE_ALLOWLIST_FILE`
-2. `DISPATCH_CALLABLE_ALLOWLIST_JSON`
-3. fail with a clear configuration error
-
-Example allowlist file:
+Allowlist file:
 
 ```json
 {
@@ -137,176 +247,121 @@ Example allowlist file:
 }
 ```
 
-Example request:
+Dispatch does not accept arbitrary module paths over HTTP. The HTTP request can only reference an
+alias already configured on the worker.
 
-```powershell
-curl.exe -X POST http://localhost:4000/jobs `
-  -H "content-type: application/json" `
-  -d "{\"job_type\":\"python_callable\",\"params\":{\"callable\":\"example_job\",\"kwargs\":{\"partition_date\":\"2026-04-24\"}}}"
+The callable must:
+
+- accept JSON-compatible keyword arguments
+- return a JSON-serializable `dict`
+- raise an exception for failure
+
+The worker stores the callable return value as the job `result`.
+
+## Project-Specific Worker Images
+
+For real workloads, do not pass package names or callable maps through runtime env. Build a small
+derived worker image that owns the code and capability list.
+
+Example:
+
+```dockerfile
+FROM ghcr.io/your-org/dispatch-core:latest
+
+RUN /opt/dispatch-python/bin/python -m pip install .
+
+COPY deploy/dispatch-worker/dispatch_callables.json /etc/dispatch/callables.json
+
+ENV DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json
 ```
 
-The callable must return a JSON-serializable object. The worker prints that object to stdout,
-and the coordinator stores it in `result`. If import, validation, or callable execution fails,
-the worker writes a concise error to stderr, exits non-zero, and Dispatch stores the job as
-`failed`.
+This split keeps responsibilities clear:
 
-## Recovery Behavior
+- Dispatch core image owns the coordinator, worker runtime, and generic runner
+- project image owns installed project code and allowlisted callable aliases
+- deployment env owns secrets and environment-specific settings
+- job params carry only business inputs, not secrets
 
-- A worker claim moves the job from `jobs:queue` to `jobs:processing` with Redis `BRPOPLPUSH`
-- When a worker starts a job, the coordinator updates the job hash from `queued` to `running` and sets `started_at`
-- When a worker finishes, the coordinator only accepts a transition from `running` to `success` or `failed`
-- Completion stores `finished_at` and removes the job from `jobs:processing`
-- The coordinator runs a recovery scan every 30 seconds
-- Any job still marked `running` for more than 180 seconds is treated as stuck, moved back to `jobs:queue`, and reset to `queued`
-- Stale worker results are rejected if the job has already been requeued and started again
+Example worker compose using a derived image:
 
-## Dokploy Deployment
+```yaml
+services:
+  worker:
+    image: ghcr.io/your-org/my-project-dispatch-worker:latest
+    environment:
+      APP_ROLE: worker
+      COORDINATOR_URL: http://coordinator:4000
+      WORKER_NAME: worker-1
+      WORKER_CONCURRENCY: 5
+      PYTHON_ROOT: /app/python
+      PYTHON_BIN: /opt/dispatch-python/bin/python
+      API_KEY: ${API_KEY}
+      AWS_REGION: ${AWS_REGION}
+```
 
-The simplest two-server setup is:
+Secrets such as API keys and cloud credentials should be provided through your deployment platform,
+cloud IAM, or secret manager. Do not send secrets through `params`; job payloads are stored in Redis.
 
-- Dagster server: coordinator + Redis
-- Worker server: worker container only
+## Docker Compose
 
-This repo includes one image and two Dokploy-friendly compose files:
+This repo includes two Compose files:
 
-- `dokploy-coordinator.compose.yml`
-- `dokploy-worker.compose.yml`
-- `python/tools/dokploy_deploy.py`
-- `.env.example`
+- `dokploy-coordinator.compose.yml`: coordinator plus Redis
+- `dokploy-worker.compose.yml`: generic worker service
 
-### 1. Deploy the coordinator on the Dagster server
+They are Dokploy-friendly, but the same idea works with any Docker Compose host.
 
-Create a Dokploy Compose service on the Dagster server using `dokploy-coordinator.compose.yml`.
+Coordinator:
 
-This stack runs:
+```env
+REDIS_URL=redis://redis:6379/0
+COORDINATOR_BIND_IP=0.0.0.0
+```
 
-- `redis`
-- `coordinator`
+Worker:
 
-Recommended environment values:
+```env
+COORDINATOR_URL=http://<coordinator-host>:4000
+WORKER_NAME=worker-1
+WORKER_CONCURRENCY=5
+```
 
-- `REDIS_URL=redis://redis:6379/0`
-- `COORDINATOR_BIND_IP=10.77.0.2`
+The worker does not need Redis access. It only needs HTTP reachability to the coordinator.
 
-Expose the coordinator either:
+## Dokploy API Helper
 
-- through a Dokploy domain such as `https://dispatch.example.com`, or
-- directly on the server IP and port, such as `http://10.0.0.12:4000`
+`python/tools/dokploy_deploy.py` can create/update two Dokploy compose services:
 
-Use that same URL everywhere else as the coordinator URL. With private networking, the intended setup is:
+- coordinator service in one Dokploy project/environment/server
+- worker service in another Dokploy project/environment/server
 
-- bind the coordinator on `10.77.0.2:4000`
-- point workers and Dagster at `http://10.77.0.2:4000`
-
-### 2. Deploy the worker on the second server
-
-Create a second Dokploy Compose service on the worker server using `dokploy-worker.compose.yml`.
-
-Required environment values:
-
-- `COORDINATOR_URL=https://dispatch.example.com`
-  or `http://10.0.0.12:4000`
-
-Useful worker settings:
-
-- `WORKER_NAME=worker-server-1`
-- `WORKER_CONCURRENCY=5`
-- `WORKER_POLL_INTERVAL_MS=1000`
-- `PYTHON_BIN=/opt/dispatch-python/bin/python`
-- `DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json`
-
-To run project-specific callables, the worker image must install the relevant Python package at
-build time. For example:
-
-- `PYTHON_PACKAGE_SPEC=git+https://github.com/example/project.git#subdirectory=python_package`
-
-Project-specific credentials should be set as worker runtime env vars. For example, a stock
-landing workload might need:
-
-- `FMP_API_KEY` or `API_KEY`
-- `BUCKET_NAME` or `S3_BUCKET`
-- AWS credentials or role permissions for S3 writes
-- optional AWS region values such as `AWS_REGION` or `AWS_DEFAULT_REGION`
-
-The worker no longer needs direct Redis access. It only needs reachability to the coordinator URL.
-
-### 3. Scale workers
-
-You have two simple options:
-
-- increase `WORKER_CONCURRENCY` on the worker service
-- deploy another worker service on the same or another server
-
-For a first real test, one worker service with `WORKER_CONCURRENCY=2` is enough.
-
-### Dokploy API deployment
-
-If you want to drive the rollout through the Dokploy API instead of the UI:
-
-1. Copy `.env.example` to `.env`
-2. Fill in:
-   - `DOKPLOY_BASE_URL`
-   - `DOKPLOY_API_KEY`
-   - `DOKPLOY_COORDINATOR_PROJECT_NAME`
-   - `DOKPLOY_COORDINATOR_ENVIRONMENT_NAME`
-   - `DOKPLOY_COORDINATOR_ENVIRONMENT_ID`
-   - `DOKPLOY_COORDINATOR_SERVER_ID`
-   - `DOKPLOY_WORKER_PROJECT_NAME`
-   - `DOKPLOY_WORKER_ENVIRONMENT_NAME`
-   - `DOKPLOY_WORKER_ENVIRONMENT_ID`
-   - `DOKPLOY_WORKER_SERVER_ID`
-   - `DISPATCH_COORDINATOR_URL`
-   - `COORDINATOR_BIND_IP`
-   - `DOKPLOY_GIT_URL`
-   - `DOKPLOY_GIT_BRANCH`
-   - optional: `PYTHON_PACKAGE_SPEC`
-   - optional: `DISPATCH_CALLABLE_ALLOWLIST_FILE`
-   - optional: `DISPATCH_CALLABLE_ALLOWLIST_JSON`
-3. Run:
+Use `.env.example` as the template:
 
 ```powershell
+Copy-Item .env.example .env
 python .\python\tools\dokploy_deploy.py
 ```
 
-The script:
+The helper is optional. You can also create the Compose services manually in Dokploy.
 
-- creates or updates the coordinator compose service in the existing Dagster project
-- creates the worker project and production environment if they do not exist yet
-- creates or updates the worker compose service in that separate worker project
-- saves the environment variables for each compose service
-- triggers deployment for both services
+## Dagster Integration
 
-For private-network deployment, set:
+Dagster should treat Dispatch as a normal external service.
 
-- `DISPATCH_COORDINATOR_URL=http://<dagster-private-ip>:4000`
-- `COORDINATOR_BIND_IP=<dagster-private-ip>`
-
-The worker service will use that private address to poll the coordinator.
-
-It uses Dokploy's current API flow around `compose.create`, `compose.update`, `compose.saveEnvironment`, and `compose.deploy`:
-
-- https://docs.dokploy.com/docs/api/compose
-- https://docs.dokploy.com/docs/api
-
-## Dagster Wiring
-
-Use the coordinator as a normal external service from Dagster. Do not build a custom executor or run launcher for this MVP.
-
-The repo includes:
+This repo includes a small optional helper:
 
 - `python/dagster_dispatch/client.py`
 - `python/dagster_dispatch/resource.py`
 - `python/examples/dagster_dispatch_asset.py`
-- `prompts/data-engineering-agent-dispatch-resource.md`
 
-The intended pattern is:
+Typical pattern:
 
-1. Copy `python/dagster_dispatch/` into your Dagster code location.
+1. Add `python/dagster_dispatch` to your Dagster code location.
 2. Set `DISPATCH_COORDINATOR_URL` in the Dagster deployment.
-3. Register `DispatchCoordinatorResource` with `dg.EnvVar("DISPATCH_COORDINATOR_URL")`.
-4. Call `dispatch.run_job_and_wait(...)` from the asset or op that should offload work.
+3. Register `DispatchCoordinatorResource`.
+4. Submit Dispatch jobs from selected assets or ops.
 
-Minimal Dagster resource setup:
+Minimal resource setup:
 
 ```python
 import dagster as dg
@@ -330,32 +385,58 @@ def remote_fetch_prices(
     context: dg.AssetExecutionContext,
     dispatch: DispatchCoordinatorResource,
 ):
-    job = dispatch.run_job_and_wait(
+    return dispatch.run_job_and_wait(
         context,
         "fetch_prices",
         {"symbol": "AAPL"},
     )
-    return job
 ```
 
-If you want your data engineering agent to implement the integration in the real Dagster repo, use:
+Dispatch is not a Dagster executor. Dagster still owns orchestration, dependencies, schedules,
+partitions, asset materialization, and retries at the pipeline level.
 
-- `prompts/data-engineering-agent-dispatch-resource.md`
+## Scaling Workers
 
-## Real Test Flow
+To increase capacity:
 
-1. Deploy `dokploy-coordinator.compose.yml` to the Dagster server.
-2. Confirm the coordinator is reachable with `POST /jobs` and `GET /jobs/:id`.
-3. Deploy `dokploy-worker.compose.yml` to the worker server with `COORDINATOR_URL` pointing at the coordinator.
-4. In the Dagster deployment, set `DISPATCH_COORDINATOR_URL` to that same coordinator URL.
-5. Add the `dagster_dispatch` helper to the Dagster codebase and materialize an asset that calls `dispatch.run_job_and_wait(...)`.
-6. Verify the worker logs show the job pickup and `GET /jobs/:id` returns `success`.
+- raise `WORKER_CONCURRENCY` on a worker service
+- run another worker service on the same server
+- deploy worker services on additional servers
 
-## Notes
+Total rough concurrency is:
 
-- The queue is stored in Redis list `jobs:queue`
-- In-flight jobs are stored in Redis list `jobs:processing`
-- Job state is stored in Redis hashes named `job:<id>`
-- Job hashes include `inserted_at`, `started_at`, and `finished_at`
-- The only valid state flow is `queued -> running -> success | failed`
-- There are no retries, locks, schedules, or UI layers in this MVP
+```text
+sum(WORKER_CONCURRENCY across all worker services)
+```
+
+Choose concurrency based on the workload. CPU-heavy Python jobs usually need lower concurrency than
+I/O-heavy jobs.
+
+## Testing
+
+Elixir tests:
+
+```powershell
+Set-Location .\elixir_app
+$env:APP_ROLE = "none"
+mix test
+```
+
+Python checks:
+
+```powershell
+python -m unittest discover -s python\tests -p "test_*.py"
+python -m py_compile python\scripts\python_callable.py python\scripts\fetch_prices.py python\tools\dokploy_deploy.py
+```
+
+## Current Limitations
+
+- no authentication
+- no built-in TLS termination
+- no built-in secret backend
+- no result pagination or large-result storage
+- no first-class worker health metrics
+- no retry policy beyond stuck-job recovery
+
+For production-shaped jobs, return durable output pointers and metadata, not large datasets, in the
+job result.

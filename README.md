@@ -302,6 +302,36 @@ services:
 Secrets such as API keys and cloud credentials should be provided through your deployment platform,
 cloud IAM, or secret manager. Do not send secrets through `params`; job payloads are stored in Redis.
 
+## Publishing A Core Image
+
+This repo includes a GitHub Actions workflow that publishes the generic Dispatch core worker image
+to GitHub Container Registry:
+
+```text
+.github/workflows/publish-core-image.yml
+```
+
+Published tags:
+
+```text
+ghcr.io/abdulrahman-97/dispatch-core-worker:main
+ghcr.io/abdulrahman-97/dispatch-core-worker:sha-<git-sha>
+```
+
+Use the immutable `sha-<git-sha>` tag when building derived worker images.
+
+Local equivalent:
+
+```powershell
+$DISPATCH_SHA = git rev-parse HEAD
+
+docker build `
+  -t ghcr.io/abdulrahman-97/dispatch-core-worker:sha-$DISPATCH_SHA `
+  .
+
+docker push ghcr.io/abdulrahman-97/dispatch-core-worker:sha-$DISPATCH_SHA
+```
+
 ## Docker Compose
 
 This repo includes two Compose files:

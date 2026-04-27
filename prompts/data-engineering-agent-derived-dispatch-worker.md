@@ -112,10 +112,9 @@ Important constraints:
 - Do not pass secrets through Dispatch job params.
 - Do not require `DISPATCH_CALLABLE_ALLOWLIST_JSON` for this production path; prefer the allowlist file baked into the derived image.
 
-One Dispatch-side follow-up may be needed:
+Dispatch-side support now exists:
 
-- Dispatch currently supports env JSON allowlists.
-- Ask Dispatch to also support `DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json` with this load order:
+- Dispatch supports `DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json` with this load order:
   1. file if set
   2. JSON env if set
   3. clear failure if neither is set

@@ -5,10 +5,12 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 
-ALLOWLIST_ENV_VAR = "DISPATCH_CALLABLE_ALLOWLIST_JSON"
+ALLOWLIST_FILE_ENV_VAR = "DISPATCH_CALLABLE_ALLOWLIST_FILE"
+ALLOWLIST_JSON_ENV_VAR = "DISPATCH_CALLABLE_ALLOWLIST_JSON"
 
 
 class CallableRunnerError(RuntimeError):
@@ -56,7 +58,7 @@ def run_callable(
     if not isinstance(alias, str) or not alias:
         raise CallableRunnerError("callable must be a non-empty allowlist alias")
 
-    resolved_allowlist = allowlist if allowlist is not None else load_allowlist_from_env()
+    resolved_allowlist = allowlist if allowlist is not None else load_allowlist()
     target = resolved_allowlist.get(alias)
     if target is None:
         raise CallableRunnerError(f"callable alias is not allowed: {alias}")
@@ -74,27 +76,51 @@ def run_callable(
     return result
 
 
-def load_allowlist_from_env(env_var: str = ALLOWLIST_ENV_VAR) -> dict[str, str]:
-    raw_value = os.getenv(env_var)
+def load_allowlist(
+    *,
+    file_env_var: str = ALLOWLIST_FILE_ENV_VAR,
+    json_env_var: str = ALLOWLIST_JSON_ENV_VAR,
+) -> dict[str, str]:
+    file_path = os.getenv(file_env_var)
+    if file_path is not None and file_path.strip() != "":
+        return load_allowlist_from_file(Path(file_path), source=file_env_var)
+
+    raw_value = os.getenv(json_env_var)
 
     if raw_value is None or raw_value.strip() == "":
-        raise CallableRunnerError(f"{env_var} must be set to a JSON object")
+        raise CallableRunnerError(
+            f"{file_env_var} or {json_env_var} must be set to an allowlist"
+        )
 
+    return parse_allowlist_json(raw_value, source=json_env_var)
+
+
+def load_allowlist_from_file(path: Path, *, source: str) -> dict[str, str]:
+    if not path.exists():
+        raise CallableRunnerError(f"{source} file does not exist: {path}")
+
+    if not path.is_file():
+        raise CallableRunnerError(f"{source} must point to a file: {path}")
+
+    return parse_allowlist_json(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def parse_allowlist_json(raw_value: str, *, source: str) -> dict[str, str]:
     try:
         decoded = json.loads(raw_value)
     except json.JSONDecodeError as exc:
-        raise CallableRunnerError(f"{env_var} must contain valid JSON") from exc
+        raise CallableRunnerError(f"{source} must contain valid JSON") from exc
 
     if not isinstance(decoded, dict):
-        raise CallableRunnerError(f"{env_var} must be a JSON object")
+        raise CallableRunnerError(f"{source} must be a JSON object")
 
     allowlist: dict[str, str] = {}
     for alias, target in decoded.items():
         if not isinstance(alias, str) or not alias:
-            raise CallableRunnerError(f"{env_var} contains an invalid alias")
+            raise CallableRunnerError(f"{source} contains an invalid alias")
 
         if not isinstance(target, str) or not target:
-            raise CallableRunnerError(f"{env_var} contains an invalid target for {alias}")
+            raise CallableRunnerError(f"{source} contains an invalid target for {alias}")
 
         allowlist[alias] = target
 

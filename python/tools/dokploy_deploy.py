@@ -328,6 +328,7 @@ def build_worker_env() -> str:
         optional_env_lines(
             [
                 "PYTHON_PACKAGE_SPEC",
+                "DISPATCH_CALLABLE_ALLOWLIST_FILE",
                 "DISPATCH_CALLABLE_ALLOWLIST_JSON",
                 "FMP_API_KEY",
                 "API_KEY",

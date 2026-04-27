@@ -25,6 +25,7 @@ def load_runner_module() -> types.ModuleType:
 
 class PythonCallableTests(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_FILE", None)
         os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_JSON", None)
         self.runner = load_runner_module()
         self.fake_module = types.ModuleType("fake_dispatch_jobs")
@@ -34,6 +35,7 @@ class PythonCallableTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         sys.modules.pop("fake_dispatch_jobs", None)
+        os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_FILE", None)
         os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_JSON", None)
 
     def test_runs_allowlisted_callable(self) -> None:
@@ -69,10 +71,55 @@ class PythonCallableTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["partition_date"], "2026-04-24")
 
+    def test_runs_allowlist_loaded_from_file(self) -> None:
+        allowlist_path = Path(__file__).with_name("_test_dispatch_callables.json")
+        allowlist_path.write_text(
+            json.dumps({"demo_success": "fake_dispatch_jobs:success"}),
+            encoding="utf-8",
+        )
+
+        try:
+            os.environ["DISPATCH_CALLABLE_ALLOWLIST_FILE"] = str(allowlist_path)
+            result = self.runner.run_callable(
+                {
+                    "callable": "demo_success",
+                    "kwargs": {"partition_date": "2026-04-24"},
+                },
+            )
+        finally:
+            allowlist_path.unlink(missing_ok=True)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["partition_date"], "2026-04-24")
+
+    def test_file_allowlist_takes_precedence_over_json_env(self) -> None:
+        allowlist_path = Path(__file__).with_name("_test_dispatch_callables.json")
+        allowlist_path.write_text(
+            json.dumps({"demo_success": "fake_dispatch_jobs:success"}),
+            encoding="utf-8",
+        )
+
+        try:
+            os.environ["DISPATCH_CALLABLE_ALLOWLIST_FILE"] = str(allowlist_path)
+            os.environ["DISPATCH_CALLABLE_ALLOWLIST_JSON"] = json.dumps(
+                {"other": "fake_dispatch_jobs:success"}
+            )
+
+            result = self.runner.run_callable(
+                {
+                    "callable": "demo_success",
+                    "kwargs": {"partition_date": "2026-04-24"},
+                },
+            )
+        finally:
+            allowlist_path.unlink(missing_ok=True)
+
+        self.assertEqual(result["status"], "success")
+
     def test_requires_env_allowlist_when_not_provided(self) -> None:
         with self.assertRaisesRegex(
             self.runner.CallableRunnerError,
-            "DISPATCH_CALLABLE_ALLOWLIST_JSON",
+            "DISPATCH_CALLABLE_ALLOWLIST_FILE or DISPATCH_CALLABLE_ALLOWLIST_JSON",
         ):
             self.runner.run_callable({"callable": "demo_success", "kwargs": {}})
 

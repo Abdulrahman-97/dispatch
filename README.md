@@ -118,14 +118,23 @@ Dispatch supports one generic callable job type:
 - `params.callable`: an allowlisted alias
 - `params.kwargs`: JSON object passed to the callable as keyword arguments
 
-Dispatch does not accept arbitrary module paths over HTTP. The alias allowlist lives in
-`DISPATCH_CALLABLE_ALLOWLIST_JSON` on the worker. Allowlist values use `module:function`
-format.
+Dispatch does not accept arbitrary module paths over HTTP. The alias allowlist lives on the
+worker as either `DISPATCH_CALLABLE_ALLOWLIST_FILE` or `DISPATCH_CALLABLE_ALLOWLIST_JSON`.
+File-based allowlists are preferred for project-specific worker images. Allowlist values use
+`module:function` format.
 
-Example allowlist:
+Allowlist loading order:
 
-```text
-DISPATCH_CALLABLE_ALLOWLIST_JSON={"example_job":"my_project.jobs:run_example_job"}
+1. `DISPATCH_CALLABLE_ALLOWLIST_FILE`
+2. `DISPATCH_CALLABLE_ALLOWLIST_JSON`
+3. fail with a clear configuration error
+
+Example allowlist file:
+
+```json
+{
+  "example_job": "my_project.jobs:run_example_job"
+}
 ```
 
 Example request:
@@ -204,7 +213,7 @@ Useful worker settings:
 - `WORKER_CONCURRENCY=5`
 - `WORKER_POLL_INTERVAL_MS=1000`
 - `PYTHON_BIN=/opt/dispatch-python/bin/python`
-- `DISPATCH_CALLABLE_ALLOWLIST_JSON={"example_job":"my_project.jobs:run_example_job"}`
+- `DISPATCH_CALLABLE_ALLOWLIST_FILE=/etc/dispatch/callables.json`
 
 To run project-specific callables, the worker image must install the relevant Python package at
 build time. For example:
@@ -251,6 +260,7 @@ If you want to drive the rollout through the Dokploy API instead of the UI:
    - `DOKPLOY_GIT_URL`
    - `DOKPLOY_GIT_BRANCH`
    - optional: `PYTHON_PACKAGE_SPEC`
+   - optional: `DISPATCH_CALLABLE_ALLOWLIST_FILE`
    - optional: `DISPATCH_CALLABLE_ALLOWLIST_JSON`
 3. Run:
 

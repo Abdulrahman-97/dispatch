@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import sys
 import types
 import unittest
@@ -23,6 +25,7 @@ def load_runner_module() -> types.ModuleType:
 
 class PythonCallableTests(unittest.TestCase):
     def setUp(self) -> None:
+        os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_JSON", None)
         self.runner = load_runner_module()
         self.fake_module = types.ModuleType("fake_dispatch_jobs")
         self.fake_module.success = self.success
@@ -31,6 +34,7 @@ class PythonCallableTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         sys.modules.pop("fake_dispatch_jobs", None)
+        os.environ.pop("DISPATCH_CALLABLE_ALLOWLIST_JSON", None)
 
     def test_runs_allowlisted_callable(self) -> None:
         result = self.runner.run_callable(
@@ -49,6 +53,37 @@ class PythonCallableTests(unittest.TestCase):
                 "status": "success",
             },
         )
+
+    def test_runs_allowlist_loaded_from_env(self) -> None:
+        os.environ["DISPATCH_CALLABLE_ALLOWLIST_JSON"] = json.dumps(
+            {"demo_success": "fake_dispatch_jobs:success"}
+        )
+
+        result = self.runner.run_callable(
+            {
+                "callable": "demo_success",
+                "kwargs": {"partition_date": "2026-04-24"},
+            },
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["partition_date"], "2026-04-24")
+
+    def test_requires_env_allowlist_when_not_provided(self) -> None:
+        with self.assertRaisesRegex(
+            self.runner.CallableRunnerError,
+            "DISPATCH_CALLABLE_ALLOWLIST_JSON",
+        ):
+            self.runner.run_callable({"callable": "demo_success", "kwargs": {}})
+
+    def test_rejects_invalid_env_allowlist(self) -> None:
+        os.environ["DISPATCH_CALLABLE_ALLOWLIST_JSON"] = "[]"
+
+        with self.assertRaisesRegex(
+            self.runner.CallableRunnerError,
+            "must be a JSON object",
+        ):
+            self.runner.run_callable({"callable": "demo_success", "kwargs": {}})
 
     def test_rejects_unallowlisted_alias(self) -> None:
         with self.assertRaisesRegex(

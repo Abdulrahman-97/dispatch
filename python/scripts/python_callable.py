@@ -2,17 +2,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping
 from typing import Any
 
 
-CALLABLE_ALLOWLIST = {
-    "stocks_tickers_daily_landing": (
-        "stocks.defs.tickers_daily.tickers_daily_new:"
-        "run_tickers_daily_landing_from_env"
-    ),
-}
+ALLOWLIST_ENV_VAR = "DISPATCH_CALLABLE_ALLOWLIST_JSON"
 
 
 class CallableRunnerError(RuntimeError):
@@ -52,7 +48,7 @@ def parse_params(raw_params: str) -> dict[str, Any]:
 def run_callable(
     params: Mapping[str, Any],
     *,
-    allowlist: Mapping[str, str] = CALLABLE_ALLOWLIST,
+    allowlist: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     alias = params.get("callable")
     kwargs = params.get("kwargs", {})
@@ -60,7 +56,8 @@ def run_callable(
     if not isinstance(alias, str) or not alias:
         raise CallableRunnerError("callable must be a non-empty allowlist alias")
 
-    target = allowlist.get(alias)
+    resolved_allowlist = allowlist if allowlist is not None else load_allowlist_from_env()
+    target = resolved_allowlist.get(alias)
     if target is None:
         raise CallableRunnerError(f"callable alias is not allowed: {alias}")
 
@@ -75,6 +72,33 @@ def run_callable(
 
     ensure_json_serializable(result)
     return result
+
+
+def load_allowlist_from_env(env_var: str = ALLOWLIST_ENV_VAR) -> dict[str, str]:
+    raw_value = os.getenv(env_var)
+
+    if raw_value is None or raw_value.strip() == "":
+        raise CallableRunnerError(f"{env_var} must be set to a JSON object")
+
+    try:
+        decoded = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise CallableRunnerError(f"{env_var} must contain valid JSON") from exc
+
+    if not isinstance(decoded, dict):
+        raise CallableRunnerError(f"{env_var} must be a JSON object")
+
+    allowlist: dict[str, str] = {}
+    for alias, target in decoded.items():
+        if not isinstance(alias, str) or not alias:
+            raise CallableRunnerError(f"{env_var} contains an invalid alias")
+
+        if not isinstance(target, str) or not target:
+            raise CallableRunnerError(f"{env_var} contains an invalid target for {alias}")
+
+        allowlist[alias] = target
+
+    return allowlist
 
 
 def resolve_callable(target: str) -> Callable[..., Any]:

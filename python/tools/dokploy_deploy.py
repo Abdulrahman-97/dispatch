@@ -327,7 +327,8 @@ def build_worker_env() -> str:
     lines.extend(
         optional_env_lines(
             [
-                "STOCKS_PACKAGE_SPEC",
+                "PYTHON_PACKAGE_SPEC",
+                "DISPATCH_CALLABLE_ALLOWLIST_JSON",
                 "FMP_API_KEY",
                 "API_KEY",
                 "BUCKET_NAME",

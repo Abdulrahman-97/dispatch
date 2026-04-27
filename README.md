@@ -119,12 +119,13 @@ Dispatch supports one generic callable job type:
 - `params.kwargs`: JSON object passed to the callable as keyword arguments
 
 Dispatch does not accept arbitrary module paths over HTTP. The alias allowlist lives in
-`python/scripts/python_callable.py`.
+`DISPATCH_CALLABLE_ALLOWLIST_JSON` on the worker. Allowlist values use `module:function`
+format.
 
-Current allowlist:
+Example allowlist:
 
 ```text
-stocks_tickers_daily_landing -> stocks.defs.tickers_daily.tickers_daily_new:run_tickers_daily_landing_from_env
+DISPATCH_CALLABLE_ALLOWLIST_JSON={"example_job":"my_project.jobs:run_example_job"}
 ```
 
 Example request:
@@ -132,7 +133,7 @@ Example request:
 ```powershell
 curl.exe -X POST http://localhost:4000/jobs `
   -H "content-type: application/json" `
-  -d "{\"job_type\":\"python_callable\",\"params\":{\"callable\":\"stocks_tickers_daily_landing\",\"kwargs\":{\"partition_date\":\"2026-04-24\"}}}"
+  -d "{\"job_type\":\"python_callable\",\"params\":{\"callable\":\"example_job\",\"kwargs\":{\"partition_date\":\"2026-04-24\"}}}"
 ```
 
 The callable must return a JSON-serializable object. The worker prints that object to stdout,
@@ -203,13 +204,15 @@ Useful worker settings:
 - `WORKER_CONCURRENCY=5`
 - `WORKER_POLL_INTERVAL_MS=1000`
 - `PYTHON_BIN=/opt/dispatch-python/bin/python`
+- `DISPATCH_CALLABLE_ALLOWLIST_JSON={"example_job":"my_project.jobs:run_example_job"}`
 
-To run Dagster/stocks callables, the worker image must install the stocks package at build time.
-For the current Dagster/stocks repo layout, set:
+To run project-specific callables, the worker image must install the relevant Python package at
+build time. For example:
 
-- `STOCKS_PACKAGE_SPEC=git+https://github.com/Abdulrahman-97/dagster-stocks.git#subdirectory=stocks`
+- `PYTHON_PACKAGE_SPEC=git+https://github.com/example/project.git#subdirectory=python_package`
 
-For the first real landing workload, the worker runtime also needs:
+Project-specific credentials should be set as worker runtime env vars. For example, a stock
+landing workload might need:
 
 - `FMP_API_KEY` or `API_KEY`
 - `BUCKET_NAME` or `S3_BUCKET`
@@ -247,6 +250,8 @@ If you want to drive the rollout through the Dokploy API instead of the UI:
    - `COORDINATOR_BIND_IP`
    - `DOKPLOY_GIT_URL`
    - `DOKPLOY_GIT_BRANCH`
+   - optional: `PYTHON_PACKAGE_SPEC`
+   - optional: `DISPATCH_CALLABLE_ALLOWLIST_JSON`
 3. Run:
 
 ```powershell

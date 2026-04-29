@@ -106,7 +106,7 @@ Reliability behavior:
 - jobs are claimed with `BRPOPLPUSH jobs:queue jobs:processing 0`
 - completed jobs are removed from `jobs:processing` with `LREM`
 - job hashes include `inserted_at`, `started_at`, and `finished_at`
-- the coordinator periodically requeues stuck `running` jobs
+- the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
 - stale worker results are rejected if a job was already recovered and restarted
 
 ## Configuration
@@ -117,6 +117,7 @@ Coordinator:
 APP_ROLE=coordinator
 REDIS_URL=redis://localhost:6379/0
 PORT=4000
+DISPATCH_JOB_STUCK_AFTER_SECONDS=1800
 ```
 
 Worker:

@@ -9,7 +9,7 @@ defmodule Dispatch.Coordinator.Recovery do
   alias Dispatch.Coordinator.JobStore
 
   @scan_interval_ms 30_000
-  @stuck_after_seconds 180
+  @default_stuck_after_seconds 1_800
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -44,7 +44,7 @@ defmodule Dispatch.Coordinator.Recovery do
     with {:ok, job} <- JobStore.get(job_id),
          "running" <- job["status"],
          started_at when is_binary(started_at) <- JobStore.processing_started_at(job),
-         true <- older_than_threshold?(started_at, now) do
+         true <- older_than_threshold?(started_at, now, stuck_after_seconds()) do
       case JobStore.requeue_stuck(job_id, started_at) do
         {:ok, :requeued} ->
           Logger.warning("recovery_requeued job=#{job_id} started_at=#{started_at}")
@@ -70,10 +70,16 @@ defmodule Dispatch.Coordinator.Recovery do
     end
   end
 
-  defp older_than_threshold?(started_at, now) do
+  def stuck_after_seconds do
+    ("DISPATCH_JOB_STUCK_AFTER_SECONDS"
+     |> System.get_env(System.get_env("JOB_STUCK_AFTER_SECONDS", "#{@default_stuck_after_seconds}")))
+    |> String.to_integer()
+  end
+
+  def older_than_threshold?(started_at, now, threshold_seconds \\ stuck_after_seconds()) do
     case DateTime.from_iso8601(started_at) do
       {:ok, started_at_dt, _offset} ->
-        DateTime.diff(now, started_at_dt, :second) > @stuck_after_seconds
+        DateTime.diff(now, started_at_dt, :second) > threshold_seconds
 
       {:error, _reason} ->
         false

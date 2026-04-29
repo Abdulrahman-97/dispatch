@@ -19,6 +19,7 @@ services:
       APP_ROLE: coordinator
       PORT: 4000
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DISPATCH_JOB_STUCK_AFTER_SECONDS: ${DISPATCH_JOB_STUCK_AFTER_SECONDS:-1800}
     ports:
       - "${COORDINATOR_BIND_IP:-0.0.0.0}:4000:4000"
     restart: unless-stopped

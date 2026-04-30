@@ -28,7 +28,9 @@ defmodule Dispatch.Coordinator.JobStore do
     "result",
     "",
     "error",
-    ""
+    "",
+    "worker_name",
+    ARGV[2]
   )
 
   return "ok"
@@ -62,6 +64,10 @@ defmodule Dispatch.Coordinator.JobStore do
     "finished_at",
     ARGV[6]
   )
+
+  if ARGV[7] ~= "" then
+    redis.call("HSET", key, "worker_name", ARGV[7])
+  end
 
   redis.call("LREM", processing_key, "1", ARGV[1])
 
@@ -99,6 +105,8 @@ defmodule Dispatch.Coordinator.JobStore do
     "result",
     "",
     "error",
+    "",
+    "worker_name",
     ""
   )
 
@@ -122,6 +130,8 @@ defmodule Dispatch.Coordinator.JobStore do
       "started_at",
       "",
       "finished_at",
+      "",
+      "worker_name",
       ""
     ])
   end
@@ -145,8 +155,11 @@ defmodule Dispatch.Coordinator.JobStore do
     end
   end
 
-  def mark_running(job_id, started_at) do
-    case transition(@mark_running_script, [job_key(job_id)], [started_at]) do
+  def mark_running(job_id, started_at, worker_name \\ nil) do
+    case transition(@mark_running_script, [job_key(job_id)], [
+           started_at,
+           normalize_worker_name(worker_name)
+         ]) do
       {:ok, "ok"} -> {:ok, :running}
       {:ok, "not_found"} -> {:error, :not_found}
       {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
@@ -164,7 +177,8 @@ defmodule Dispatch.Coordinator.JobStore do
              attrs["status"],
              attrs["result"] || "",
              attrs["error"] || "",
-             now_iso8601()
+             now_iso8601(),
+             normalize_worker_name(attrs["worker_name"])
            ]
          ) do
       {:ok, "ok"} -> {:ok, :completed}
@@ -194,7 +208,8 @@ defmodule Dispatch.Coordinator.JobStore do
       job_id: job_id,
       status: fields["status"],
       result: normalize_field(fields["result"]),
-      error: normalize_field(fields["error"])
+      error: normalize_field(fields["error"]),
+      worker_name: normalize_field(fields["worker_name"])
     }
   end
 
@@ -210,6 +225,9 @@ defmodule Dispatch.Coordinator.JobStore do
 
   defp normalize_field(""), do: nil
   defp normalize_field(value), do: value
+
+  defp normalize_worker_name(value) when is_binary(value), do: String.trim(value)
+  defp normalize_worker_name(_value), do: ""
 
   defp transition(script, keys, args) do
     Redix.command(@redis_name, ["EVAL", script, Integer.to_string(length(keys)) | keys ++ args])

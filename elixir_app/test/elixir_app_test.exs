@@ -13,6 +13,29 @@ defmodule ElixirAppTest do
            ]
   end
 
+  test "job status includes worker attribution when available" do
+    status =
+      Dispatch.Coordinator.JobStore.format_status("job-1", %{
+        "status" => "success",
+        "result" => "{}",
+        "error" => "",
+        "worker_name" => "findash-stocks-worker-1"
+      })
+
+    assert status.worker_name == "findash-stocks-worker-1"
+  end
+
+  test "job status keeps worker attribution optional for old jobs" do
+    status =
+      Dispatch.Coordinator.JobStore.format_status("job-1", %{
+        "status" => "queued",
+        "result" => "",
+        "error" => ""
+      })
+
+    assert status.worker_name == nil
+  end
+
   test "coordinator recovery threshold is configurable" do
     started_at = DateTime.utc_now() |> DateTime.add(-240, :second) |> DateTime.to_iso8601()
     now = DateTime.utc_now()

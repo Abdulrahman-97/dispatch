@@ -19,7 +19,7 @@ defmodule Dispatch.Coordinator.JobQueue do
     end
   end
 
-  def claim_next do
+  def claim_next(worker_name \\ nil) do
     case Redix.command(@redis_name, claim_command()) do
       {:ok, nil} ->
         :empty
@@ -27,9 +27,9 @@ defmodule Dispatch.Coordinator.JobQueue do
       {:ok, job_id} ->
         started_at = now_iso8601()
 
-        case JobStore.mark_running(job_id, started_at) do
+        case JobStore.mark_running(job_id, started_at, worker_name) do
           {:ok, :running} ->
-            claimed_job(job_id, started_at)
+            claimed_job(job_id, started_at, worker_name)
 
           {:error, reason} ->
             _ = remove_from_processing(job_id)
@@ -53,11 +53,18 @@ defmodule Dispatch.Coordinator.JobQueue do
     Redix.command(@redis_name, ["LREM", @processing_key, "1", job_id])
   end
 
-  defp claimed_job(job_id, started_at) do
+  defp claimed_job(job_id, started_at, worker_name) do
     with {:ok, payload} <- JobStore.payload(job_id),
          job_type when is_binary(job_type) <- Map.get(payload, "job_type"),
          params when is_map(params) <- Map.get(payload, "params", %{}) do
-      {:ok, %{job_id: job_id, job_type: job_type, params: params, started_at: started_at}}
+      {:ok,
+       %{
+         job_id: job_id,
+         job_type: job_type,
+         params: params,
+         started_at: started_at,
+         worker_name: worker_name
+       }}
     else
       _ ->
         _ =

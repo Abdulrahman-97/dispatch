@@ -76,7 +76,8 @@ Response:
   "job_id": "uuid",
   "status": "queued | running | success | failed",
   "result": "...",
-  "error": "..."
+  "error": "...",
+  "worker_name": "worker-1"
 }
 ```
 
@@ -93,7 +94,7 @@ Redis keys:
 
 - `jobs:queue`: queued job ids
 - `jobs:processing`: claimed job ids currently running
-- `job:{id}`: job hash containing status, payload, result, error, and timestamps
+- `job:{id}`: job hash containing status, payload, result, error, timestamps, and worker name
 
 State flow:
 
@@ -106,6 +107,7 @@ Reliability behavior:
 - jobs are claimed with `RPOPLPUSH jobs:queue jobs:processing`
 - completed jobs are removed from `jobs:processing` with `LREM`
 - job hashes include `inserted_at`, `started_at`, and `finished_at`
+- running and completed jobs include `worker_name` when claimed by a modern worker
 - the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
 - stale worker results are rejected if a job was already recovered and restarted
 

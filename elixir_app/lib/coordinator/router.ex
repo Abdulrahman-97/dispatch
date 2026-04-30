@@ -50,7 +50,7 @@ defmodule Dispatch.Coordinator.Router do
   end
 
   post "/internal/poll" do
-    case JobQueue.claim_next() do
+    case JobQueue.claim_next(conn.body_params["worker_name"]) do
       {:ok, job} ->
         json(conn, 200, job)
 
@@ -65,6 +65,7 @@ defmodule Dispatch.Coordinator.Router do
   post "/internal/result" do
     job_id = conn.body_params["job_id"]
     started_at = conn.body_params["started_at"]
+    worker_name = conn.body_params["worker_name"]
     status = conn.body_params["status"]
     result = conn.body_params["result"]
     error = conn.body_params["error"]
@@ -85,7 +86,8 @@ defmodule Dispatch.Coordinator.Router do
             case JobStore.complete(job_id, started_at, %{
                    "status" => status,
                    "result" => result,
-                   "error" => error
+                   "error" => error,
+                   "worker_name" => worker_name
                  }) do
               {:ok, _} -> send_resp(conn, 204, "")
               {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})

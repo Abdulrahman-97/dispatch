@@ -41,7 +41,7 @@ defmodule Dispatch.Worker.Poller do
   end
 
   defp poll_once(state) do
-    case post_json(state.coordinator_url, "/internal/poll", %{}) do
+    case post_json(state.coordinator_url, "/internal/poll", %{"worker_name" => state.worker_name}) do
       {:ok, 200, body} ->
         case Jason.decode(body) do
           {:ok, job} ->
@@ -54,6 +54,7 @@ defmodule Dispatch.Worker.Poller do
                    result
                    |> Map.put("job_id", job["job_id"])
                    |> Map.put("started_at", job["started_at"])
+                   |> Map.put("worker_name", state.worker_name)
                  ) do
               {:ok, 204, _body} ->
                 Logger.info(

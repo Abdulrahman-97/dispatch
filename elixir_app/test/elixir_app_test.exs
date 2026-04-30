@@ -5,6 +5,14 @@ defmodule ElixirAppTest do
     assert true
   end
 
+  test "coordinator claims jobs with a non-blocking atomic queue move" do
+    assert Dispatch.Coordinator.JobQueue.claim_command() == [
+             "RPOPLPUSH",
+             "jobs:queue",
+             "jobs:processing"
+           ]
+  end
+
   test "coordinator recovery threshold is configurable" do
     started_at = DateTime.utc_now() |> DateTime.add(-240, :second) |> DateTime.to_iso8601()
     now = DateTime.utc_now()

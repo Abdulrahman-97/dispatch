@@ -103,11 +103,15 @@ queued -> running -> success | failed
 
 Reliability behavior:
 
-- jobs are claimed with `BRPOPLPUSH jobs:queue jobs:processing 0`
+- jobs are claimed with `RPOPLPUSH jobs:queue jobs:processing`
 - completed jobs are removed from `jobs:processing` with `LREM`
 - job hashes include `inserted_at`, `started_at`, and `finished_at`
 - the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
 - stale worker results are rejected if a job was already recovered and restarted
+
+`RPOPLPUSH` keeps the queue-to-processing move atomic without blocking the coordinator HTTP
+request. If a worker process dies after receiving a job, recovery can still find the job id in
+`jobs:processing` and requeue it.
 
 ## Configuration
 

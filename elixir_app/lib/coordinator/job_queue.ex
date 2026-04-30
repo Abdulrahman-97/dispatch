@@ -7,7 +7,6 @@ defmodule Dispatch.Coordinator.JobQueue do
 
   @queue_key "jobs:queue"
   @processing_key "jobs:processing"
-  @claim_timeout_seconds 1
   @redis_name Dispatch.Redis
 
   def enqueue(job_type, params) do
@@ -21,12 +20,7 @@ defmodule Dispatch.Coordinator.JobQueue do
   end
 
   def claim_next do
-    case Redix.command(@redis_name, [
-           "BRPOPLPUSH",
-           @queue_key,
-           @processing_key,
-           Integer.to_string(@claim_timeout_seconds)
-         ]) do
+    case Redix.command(@redis_name, claim_command()) do
       {:ok, nil} ->
         :empty
 
@@ -45,6 +39,10 @@ defmodule Dispatch.Coordinator.JobQueue do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  def claim_command do
+    ["RPOPLPUSH", @queue_key, @processing_key]
   end
 
   def processing_job_ids do

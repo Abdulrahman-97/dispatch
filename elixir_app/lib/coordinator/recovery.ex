@@ -71,8 +71,10 @@ defmodule Dispatch.Coordinator.Recovery do
   end
 
   def stuck_after_seconds do
-    ("DISPATCH_JOB_STUCK_AFTER_SECONDS"
-     |> System.get_env(System.get_env("JOB_STUCK_AFTER_SECONDS", "#{@default_stuck_after_seconds}")))
+    "DISPATCH_JOB_STUCK_AFTER_SECONDS"
+    |> System.get_env(
+      System.get_env("JOB_STUCK_AFTER_SECONDS", "#{@default_stuck_after_seconds}")
+    )
     |> String.to_integer()
   end
 

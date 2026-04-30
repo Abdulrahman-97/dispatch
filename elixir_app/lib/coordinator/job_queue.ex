@@ -3,6 +3,7 @@ defmodule Dispatch.Coordinator.JobQueue do
 
   import Bitwise
 
+  alias Dispatch.RateLimit
   alias Dispatch.Coordinator.JobStore
 
   @queue_key "jobs:queue"
@@ -13,7 +14,8 @@ defmodule Dispatch.Coordinator.JobQueue do
     job_id = generate_job_id()
     payload_json = Jason.encode!(%{job_type: job_type, params: params})
 
-    with {:ok, _} <- JobStore.put_new(job_id, payload_json),
+    with {:ok, rate_limit_metadata} <- RateLimit.metadata_from_params(params),
+         {:ok, _} <- JobStore.put_new(job_id, payload_json, rate_limit_metadata),
          {:ok, _} <- Redix.command(@redis_name, ["RPUSH", @queue_key, job_id]) do
       {:ok, job_id}
     end

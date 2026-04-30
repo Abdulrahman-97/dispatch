@@ -304,6 +304,7 @@ def build_coordinator_env() -> str:
         [
             "REDIS_URL=redis://redis:6379/0",
             f"COORDINATOR_BIND_IP={required_env('COORDINATOR_BIND_IP')}",
+            *optional_env_lines(["DISPATCH_JOB_STUCK_AFTER_SECONDS", "DISPATCH_RATE_LIMITS_JSON"]),
             "",
         ]
     )

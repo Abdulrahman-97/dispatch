@@ -6,6 +6,7 @@ defmodule Dispatch.Worker.Poller do
   require Logger
 
   alias Dispatch.Worker.Executor
+  alias Dispatch.Worker.RateLimiter
 
   @http_options [timeout: 5_000]
   @request_options [body_format: :binary]
@@ -46,7 +47,7 @@ defmodule Dispatch.Worker.Poller do
         case Jason.decode(body) do
           {:ok, job} ->
             Logger.info("worker=#{state.worker_name} job=#{job["job_id"]} picked up")
-            result = safe_execute(job)
+            result = safe_execute(job, state)
 
             case post_json(
                    state.coordinator_url,
@@ -125,22 +126,40 @@ defmodule Dispatch.Worker.Poller do
     end
   end
 
-  defp safe_execute(job) do
+  defp safe_execute(job, state) do
     try do
-      Executor.run(job)
+      case RateLimiter.acquire(job,
+             worker_name: state.worker_name,
+             post_json: fn path, payload -> post_json(state.coordinator_url, path, payload) end
+           ) do
+        {:ok, rate_limit_wait_ms} ->
+          job
+          |> Executor.run()
+          |> Map.put("rate_limit_wait_ms", rate_limit_wait_ms)
+
+        {:error, reason} ->
+          %{
+            "status" => "failed",
+            "result" => nil,
+            "error" => reason,
+            "rate_limit_wait_ms" => 0
+          }
+      end
     rescue
       exception ->
         %{
           "status" => "failed",
           "result" => nil,
-          "error" => "executor crashed: #{Exception.message(exception)}"
+          "error" => "executor crashed: #{Exception.message(exception)}",
+          "rate_limit_wait_ms" => 0
         }
     catch
       kind, reason ->
         %{
           "status" => "failed",
           "result" => nil,
-          "error" => "executor crashed: #{kind}: #{inspect(reason)}"
+          "error" => "executor crashed: #{kind}: #{inspect(reason)}",
+          "rate_limit_wait_ms" => 0
         }
     end
   end

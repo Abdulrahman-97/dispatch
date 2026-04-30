@@ -20,6 +20,7 @@ services:
       PORT: 4000
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DISPATCH_JOB_STUCK_AFTER_SECONDS: ${DISPATCH_JOB_STUCK_AFTER_SECONDS:-1800}
+      DISPATCH_RATE_LIMITS_JSON: ${DISPATCH_RATE_LIMITS_JSON:-}
     ports:
       - "${COORDINATOR_BIND_IP:-0.0.0.0}:4000:4000"
     restart: unless-stopped

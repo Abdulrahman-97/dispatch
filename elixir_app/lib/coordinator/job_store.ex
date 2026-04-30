@@ -69,6 +69,10 @@ defmodule Dispatch.Coordinator.JobStore do
     redis.call("HSET", key, "worker_name", ARGV[7])
   end
 
+  if ARGV[8] ~= "" then
+    redis.call("HSET", key, "rate_limit_wait_ms", ARGV[8])
+  end
+
   redis.call("LREM", processing_key, "1", ARGV[1])
 
   return "ok"
@@ -107,13 +111,15 @@ defmodule Dispatch.Coordinator.JobStore do
     "error",
     "",
     "worker_name",
-    ""
+    "",
+    "rate_limit_wait_ms",
+    "0"
   )
 
   return "ok"
   """
 
-  def put_new(job_id, payload_json) do
+  def put_new(job_id, payload_json, attrs \\ %{}) do
     Redix.command(@redis_name, [
       "HSET",
       job_key(job_id),
@@ -132,7 +138,13 @@ defmodule Dispatch.Coordinator.JobStore do
       "finished_at",
       "",
       "worker_name",
-      ""
+      "",
+      "rate_limit_key",
+      attrs["rate_limit_key"] || "",
+      "rate_limit_cost",
+      attrs["rate_limit_cost"] || "",
+      "rate_limit_wait_ms",
+      attrs["rate_limit_wait_ms"] || ""
     ])
   end
 
@@ -178,7 +190,8 @@ defmodule Dispatch.Coordinator.JobStore do
              attrs["result"] || "",
              attrs["error"] || "",
              now_iso8601(),
-             normalize_worker_name(attrs["worker_name"])
+             normalize_worker_name(attrs["worker_name"]),
+             normalize_non_negative_integer(attrs["rate_limit_wait_ms"])
            ]
          ) do
       {:ok, "ok"} -> {:ok, :completed}
@@ -209,7 +222,10 @@ defmodule Dispatch.Coordinator.JobStore do
       status: fields["status"],
       result: normalize_field(fields["result"]),
       error: normalize_field(fields["error"]),
-      worker_name: normalize_field(fields["worker_name"])
+      worker_name: normalize_field(fields["worker_name"]),
+      rate_limit_key: normalize_field(fields["rate_limit_key"]),
+      rate_limit_cost: normalize_integer_field(fields["rate_limit_cost"]),
+      rate_limit_wait_ms: normalize_integer_field(fields["rate_limit_wait_ms"])
     }
   end
 
@@ -228,6 +244,28 @@ defmodule Dispatch.Coordinator.JobStore do
 
   defp normalize_worker_name(value) when is_binary(value), do: String.trim(value)
   defp normalize_worker_name(_value), do: ""
+
+  defp normalize_non_negative_integer(value) when is_integer(value) and value >= 0 do
+    Integer.to_string(value)
+  end
+
+  defp normalize_non_negative_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer >= 0 -> Integer.to_string(integer)
+      _ -> ""
+    end
+  end
+
+  defp normalize_non_negative_integer(_value), do: ""
+
+  defp normalize_integer_field(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp normalize_integer_field(_value), do: nil
 
   defp transition(script, keys, args) do
     Redix.command(@redis_name, ["EVAL", script, Integer.to_string(length(keys)) | keys ++ args])

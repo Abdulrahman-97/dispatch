@@ -4,6 +4,7 @@ defmodule Dispatch.Coordinator.Router do
   use Plug.Router
 
   alias Dispatch.Coordinator.JobQueue
+  alias Dispatch.Coordinator.RateLimiter
   alias Dispatch.Coordinator.JobStore
 
   plug(Plug.Logger)
@@ -31,6 +32,7 @@ defmodule Dispatch.Coordinator.Router do
       true ->
         case JobQueue.enqueue(job_type, params) do
           {:ok, job_id} -> json(conn, 201, %{job_id: job_id})
+          {:error, reason} when is_binary(reason) -> json(conn, 422, %{error: reason})
           {:error, reason} -> redis_error(conn, reason)
         end
     end
@@ -62,6 +64,31 @@ defmodule Dispatch.Coordinator.Router do
     end
   end
 
+  post "/internal/rate_limit/acquire" do
+    key = conn.body_params["rate_limit_key"]
+    cost = Map.get(conn.body_params, "rate_limit_cost", 1)
+
+    case RateLimiter.acquire(key, cost) do
+      {:ok, %{allowed: true} = result} ->
+        json(conn, 200, %{
+          allowed: true,
+          retry_interval_ms: result.retry_interval_ms
+        })
+
+      {:ok, %{allowed: false} = result} ->
+        json(conn, 429, %{
+          allowed: false,
+          retry_interval_ms: result.retry_interval_ms
+        })
+
+      {:error, reason} when is_binary(reason) ->
+        json(conn, 422, %{error: reason})
+
+      {:error, reason} ->
+        redis_error(conn, reason)
+    end
+  end
+
   post "/internal/result" do
     job_id = conn.body_params["job_id"]
     started_at = conn.body_params["started_at"]
@@ -87,7 +114,8 @@ defmodule Dispatch.Coordinator.Router do
                    "status" => status,
                    "result" => result,
                    "error" => error,
-                   "worker_name" => worker_name
+                   "worker_name" => worker_name,
+                   "rate_limit_wait_ms" => conn.body_params["rate_limit_wait_ms"]
                  }) do
               {:ok, _} -> send_resp(conn, 204, "")
               {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})

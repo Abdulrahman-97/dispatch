@@ -77,7 +77,10 @@ Response:
   "status": "queued | running | success | failed",
   "result": "...",
   "error": "...",
-  "worker_name": "worker-1"
+  "worker_name": "worker-1",
+  "rate_limit_key": "provider_api",
+  "rate_limit_cost": 1,
+  "rate_limit_wait_ms": 1000
 }
 ```
 
@@ -124,6 +127,7 @@ APP_ROLE=coordinator
 REDIS_URL=redis://localhost:6379/0
 PORT=4000
 DISPATCH_JOB_STUCK_AFTER_SECONDS=1800
+DISPATCH_RATE_LIMITS_JSON={"provider_api":{"limit":3000,"window_seconds":60,"retry_interval_ms":1000}}
 ```
 
 Worker:
@@ -264,6 +268,48 @@ The callable must:
 - raise an exception for failure
 
 The worker stores the callable return value as the job `result`.
+
+## Distributed Rate Limits
+
+Jobs can optionally request a Redis-backed provider/API quota before Python execution. This is
+global across all workers because acquisition is coordinated through Redis.
+
+Coordinator config:
+
+```env
+DISPATCH_RATE_LIMITS_JSON={"fmp_api":{"limit":3000,"window_seconds":60,"retry_interval_ms":1000}}
+```
+
+Job params:
+
+```json
+{
+  "callable": "stocks_tickers_daily_landing",
+  "rate_limit_key": "fmp_api",
+  "rate_limit_cost": 1,
+  "kwargs": {
+    "partition_date": "2026-04-24"
+  }
+}
+```
+
+Behavior:
+
+- jobs without `rate_limit_key` run unchanged
+- `rate_limit_cost` defaults to `1`
+- workers wait and retry when the shared window is exhausted
+- malformed rate-limit config fails process startup
+- unknown rate-limit keys or invalid costs fail clearly
+- Redis acquisition errors fail the job instead of waiting indefinitely
+
+The fixed-window Redis key is:
+
+```text
+rate_limit:<rate_limit_key>:<window_start_epoch_seconds>
+```
+
+`GET /jobs/:id` includes `rate_limit_key`, `rate_limit_cost`, and `rate_limit_wait_ms` when
+available.
 
 ## Project-Specific Worker Images
 

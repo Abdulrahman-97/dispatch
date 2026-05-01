@@ -78,8 +78,19 @@ Response:
   "result": "...",
   "error": "...",
   "worker_name": "worker-1",
+  "resources": {
+    "api_slots": 1,
+    "memory_slots": 1
+  },
+  "worker_resources": {
+    "api_slots": 50,
+    "memory_slots": 8
+  },
   "rate_limit_key": "provider_api",
   "rate_limit_cost": 1,
+  "rate_limits": {
+    "provider_api": 1
+  },
   "rate_limit_wait_ms": 1000
 }
 ```
@@ -107,16 +118,17 @@ queued -> running -> success | failed
 
 Reliability behavior:
 
-- jobs are claimed with `RPOPLPUSH jobs:queue jobs:processing`
+- jobs are claimed by an atomic Redis script that moves a matching job from `jobs:queue` to
+  `jobs:processing`
 - completed jobs are removed from `jobs:processing` with `LREM`
 - job hashes include `inserted_at`, `started_at`, and `finished_at`
 - running and completed jobs include `worker_name` when claimed by a modern worker
 - the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
 - stale worker results are rejected if a job was already recovered and restarted
 
-`RPOPLPUSH` keeps the queue-to-processing move atomic without blocking the coordinator HTTP
-request. If a worker process dies after receiving a job, recovery can still find the job id in
-`jobs:processing` and requeue it.
+The queue-to-processing move is atomic without blocking the coordinator HTTP request. If a worker
+process dies after receiving a job, recovery can still find the job id in `jobs:processing` and
+requeue it.
 
 ## Configuration
 
@@ -137,6 +149,7 @@ APP_ROLE=worker
 COORDINATOR_URL=http://localhost:4000
 WORKER_NAME=worker-1
 WORKER_CONCURRENCY=5
+DISPATCH_WORKER_RESOURCES_JSON={"cpu_slots":4,"memory_slots":8,"api_slots":50,"io_slots":10}
 WORKER_POLL_INTERVAL_MS=1000
 PYTHON_ROOT=/app/python
 PYTHON_BIN=/opt/dispatch-python/bin/python
@@ -269,10 +282,57 @@ The callable must:
 
 The worker stores the callable return value as the job `result`.
 
+## Resource-Pool Scheduling
+
+Workers advertise generic local capacity. The coordinator only assigns a queued job to a worker if
+the job's requested resources fit the worker's currently available resources.
+
+Worker config:
+
+```env
+DISPATCH_WORKER_RESOURCES_JSON={"cpu_slots":4,"memory_slots":8,"api_slots":50,"io_slots":10}
+```
+
+If `DISPATCH_WORKER_RESOURCES_JSON` is omitted, Dispatch preserves the old concurrency behavior:
+
+```json
+{
+  "default_slots": "WORKER_CONCURRENCY"
+}
+```
+
+Job params:
+
+```json
+{
+  "callable": "some_allowed_callable",
+  "resources": {
+    "api_slots": 1,
+    "memory_slots": 1
+  },
+  "kwargs": {}
+}
+```
+
+If `params.resources` is omitted, the job defaults to:
+
+```json
+{
+  "default_slots": 1
+}
+```
+
+Resource keys are project-defined strings. Dispatch does not attach provider or business meaning to
+them. A job remains queued if no polling worker advertises the required keys or if all matching
+workers are currently full. `GET /jobs/:id` includes requested `resources`, assigned
+`worker_resources`, and `queued_reason` when available.
+
 ## Distributed Rate Limits
 
 Jobs can optionally request a Redis-backed provider/API quota before Python execution. This is
-global across all workers because acquisition is coordinated through Redis.
+global across all workers because acquisition is coordinated through Redis. Rate limits are separate
+from worker resources: resources model local worker capacity, rate limits model shared external
+quotas.
 
 Coordinator config:
 
@@ -285,8 +345,9 @@ Job params:
 ```json
 {
   "callable": "stocks_tickers_daily_landing",
-  "rate_limit_key": "fmp_api",
-  "rate_limit_cost": 1,
+  "rate_limits": {
+    "fmp_api": 1
+  },
   "kwargs": {
     "partition_date": "2026-04-24"
   }
@@ -295,9 +356,9 @@ Job params:
 
 Behavior:
 
-- jobs without `rate_limit_key` run unchanged
-- `rate_limit_cost` defaults to `1`
-- workers wait and retry when the shared window is exhausted
+- jobs without rate limits run unchanged
+- the older `rate_limit_key` / `rate_limit_cost` shape still works
+- queued jobs wait until the shared window has capacity
 - malformed rate-limit config fails process startup
 - unknown rate-limit keys or invalid costs fail clearly
 - Redis acquisition errors fail the job instead of waiting indefinitely
@@ -308,8 +369,8 @@ The fixed-window Redis key is:
 rate_limit:<rate_limit_key>:<window_start_epoch_seconds>
 ```
 
-`GET /jobs/:id` includes `rate_limit_key`, `rate_limit_cost`, and `rate_limit_wait_ms` when
-available.
+`GET /jobs/:id` includes `rate_limits`, legacy `rate_limit_key` / `rate_limit_cost`, and
+`rate_limit_wait_ms` when available.
 
 ## Project-Specific Worker Images
 
@@ -346,6 +407,7 @@ services:
       COORDINATOR_URL: http://coordinator:4000
       WORKER_NAME: worker-1
       WORKER_CONCURRENCY: 5
+      DISPATCH_WORKER_RESOURCES_JSON: '{"cpu_slots":4,"memory_slots":8,"api_slots":50}'
       PYTHON_ROOT: /app/python
       PYTHON_BIN: /opt/dispatch-python/bin/python
       API_KEY: ${API_KEY}
@@ -407,6 +469,7 @@ Worker:
 COORDINATOR_URL=http://<coordinator-host>:4000
 WORKER_NAME=worker-1
 WORKER_CONCURRENCY=5
+DISPATCH_WORKER_RESOURCES_JSON=
 ```
 
 The worker does not need Redis access. It only needs HTTP reachability to the coordinator.
@@ -483,17 +546,19 @@ partitions, asset materialization, and retries at the pipeline level.
 To increase capacity:
 
 - raise `WORKER_CONCURRENCY` on a worker service
+- configure `DISPATCH_WORKER_RESOURCES_JSON` for multi-resource workloads
 - run another worker service on the same server
 - deploy worker services on additional servers
 
-Total rough concurrency is:
+Without `DISPATCH_WORKER_RESOURCES_JSON`, total rough concurrency is:
 
 ```text
 sum(WORKER_CONCURRENCY across all worker services)
 ```
 
-Choose concurrency based on the workload. CPU-heavy Python jobs usually need lower concurrency than
-I/O-heavy jobs.
+With resource pools, effective concurrency depends on each job's `params.resources` and each
+worker's advertised available resources. CPU-heavy, memory-heavy, API-heavy, and I/O-heavy jobs can
+share the same worker while consuming different resource keys.
 
 ## Testing
 

@@ -76,6 +76,35 @@ defmodule Dispatch.Coordinator.RateLimiter do
     end
   end
 
+  def entries_for_specs(specs, opts \\ []) do
+    with {:ok, limits} <- limits_from_opts(opts) do
+      now_seconds = Keyword.get_lazy(opts, :now_seconds, fn -> System.system_time(:second) end)
+
+      Enum.reduce_while(specs, {:ok, []}, fn %{key: key, cost: cost}, {:ok, acc} ->
+        case fetch_limit_config(limits, key) do
+          {:ok, limit_config} ->
+            entry = %{
+              key: key,
+              redis_key: window_key(key, limit_config.window_seconds, now_seconds),
+              limit: limit_config.limit,
+              cost: cost,
+              ttl: limit_config.window_seconds + @expire_grace_seconds,
+              retry_interval_ms: limit_config.retry_interval_ms
+            }
+
+            {:cont, {:ok, [entry | acc]}}
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+      end)
+      |> case do
+        {:ok, entries} -> {:ok, Enum.reverse(entries)}
+        other -> other
+      end
+    end
+  end
+
   defp limits_from_opts(opts) do
     case Keyword.fetch(opts, :limits) do
       {:ok, limits} -> {:ok, limits}

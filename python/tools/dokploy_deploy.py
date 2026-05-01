@@ -331,6 +331,7 @@ def build_worker_env() -> str:
                 "PYTHON_PACKAGE_SPEC",
                 "DISPATCH_CALLABLE_ALLOWLIST_FILE",
                 "DISPATCH_CALLABLE_ALLOWLIST_JSON",
+                "DISPATCH_WORKER_RESOURCES_JSON",
             ]
         )
     )

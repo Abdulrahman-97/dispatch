@@ -52,7 +52,16 @@ defmodule Dispatch.Coordinator.Router do
   end
 
   post "/internal/poll" do
-    case JobQueue.claim_next(conn.body_params["worker_name"]) do
+    available_resources =
+      Map.get(conn.body_params, "available_resources", %{"default_slots" => 1})
+
+    worker_resources = Map.get(conn.body_params, "resource_capacity", available_resources)
+
+    case JobQueue.claim_next(
+           conn.body_params["worker_name"],
+           available_resources,
+           worker_resources
+         ) do
       {:ok, job} ->
         json(conn, 200, job)
 

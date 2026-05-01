@@ -5,14 +5,6 @@ defmodule ElixirAppTest do
     assert true
   end
 
-  test "coordinator claims jobs with a non-blocking atomic queue move" do
-    assert Dispatch.Coordinator.JobQueue.claim_command() == [
-             "RPOPLPUSH",
-             "jobs:queue",
-             "jobs:processing"
-           ]
-  end
-
   test "job status includes worker attribution when available" do
     status =
       Dispatch.Coordinator.JobStore.format_status("job-1", %{
@@ -20,14 +12,20 @@ defmodule ElixirAppTest do
         "result" => "{}",
         "error" => "",
         "worker_name" => "findash-stocks-worker-1",
+        "resources" => ~s({"api_slots":1,"memory_slots":1}),
+        "worker_resources" => ~s({"api_slots":50,"memory_slots":8}),
         "rate_limit_key" => "fmp_api",
         "rate_limit_cost" => "1",
+        "rate_limits" => ~s({"fmp_api":1}),
         "rate_limit_wait_ms" => "1000"
       })
 
     assert status.worker_name == "findash-stocks-worker-1"
+    assert status.resources == %{"api_slots" => 1, "memory_slots" => 1}
+    assert status.worker_resources == %{"api_slots" => 50, "memory_slots" => 8}
     assert status.rate_limit_key == "fmp_api"
     assert status.rate_limit_cost == 1
+    assert status.rate_limits == %{"fmp_api" => 1}
     assert status.rate_limit_wait_ms == 1000
   end
 
@@ -40,6 +38,55 @@ defmodule ElixirAppTest do
       })
 
     assert status.worker_name == nil
+  end
+
+  test "job resources default to one default slot" do
+    assert Dispatch.Resources.requirements_from_params(%{}) == {:ok, %{"default_slots" => 1}}
+  end
+
+  test "job resources parse generic resource requirements" do
+    assert Dispatch.Resources.requirements_from_params(%{
+             "resources" => %{"api_slots" => 1, "memory_slots" => "2"}
+           }) == {:ok, %{"api_slots" => 1, "memory_slots" => 2}}
+  end
+
+  test "worker resources default to WORKER_CONCURRENCY when not configured" do
+    previous = System.get_env("DISPATCH_WORKER_RESOURCES_JSON")
+
+    try do
+      System.delete_env("DISPATCH_WORKER_RESOURCES_JSON")
+
+      assert Dispatch.Resources.worker_capacity_from_env(3) == {:ok, %{"default_slots" => 3}}
+    after
+      restore_env("DISPATCH_WORKER_RESOURCES_JSON", previous)
+    end
+  end
+
+  test "resource fit requires all keys and enough available capacity" do
+    requirements = %{"api_slots" => 1, "memory_slots" => 2}
+
+    assert Dispatch.Resources.fits?(requirements, %{"api_slots" => 1, "memory_slots" => 2})
+    refute Dispatch.Resources.fits?(requirements, %{"api_slots" => 1, "memory_slots" => 1})
+    assert Dispatch.Resources.missing_keys(requirements, %{"api_slots" => 1}) == ["memory_slots"]
+  end
+
+  test "available resources may include exhausted zero-capacity keys" do
+    assert Dispatch.Resources.normalize_available_resource_map(%{
+             "api_slots" => 0,
+             "memory_slots" => 2
+           }) == {:ok, %{"api_slots" => 0, "memory_slots" => 2}}
+  end
+
+  test "rate_limits object parses generic shared quotas" do
+    assert {:ok, specs} =
+             Dispatch.RateLimit.specs_from_params(%{
+               "rate_limits" => %{"provider_api" => 2, "other_api" => "1"}
+             })
+
+    assert Enum.sort_by(specs, & &1.key) == [
+             %{key: "other_api", cost: 1},
+             %{key: "provider_api", cost: 2}
+           ]
   end
 
   test "job without rate_limit_key skips rate limit acquire" do

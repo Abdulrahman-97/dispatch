@@ -15,7 +15,7 @@ defmodule Dispatch.Application do
           [redis_child(), recovery_child(), coordinator_child()]
 
         "worker" ->
-          worker_children()
+          [{Dispatch.Worker.Scheduler, []}]
 
         _ ->
           []
@@ -36,15 +36,6 @@ defmodule Dispatch.Application do
     {Redix, {redis_url(), [name: @redis_name, sync_connect: false]}}
   end
 
-  defp worker_children do
-    1..worker_concurrency()
-    |> Enum.map(fn slot ->
-      Supervisor.child_spec({Dispatch.Worker.Poller, [slot: slot]},
-        id: {Dispatch.Worker.Poller, slot}
-      )
-    end)
-  end
-
   defp role do
     System.get_env("APP_ROLE") ||
       if System.get_env("MIX_ENV") == "test", do: "none", else: "coordinator"
@@ -56,11 +47,6 @@ defmodule Dispatch.Application do
 
   defp coordinator_port do
     System.get_env("PORT", "4000")
-    |> String.to_integer()
-  end
-
-  defp worker_concurrency do
-    System.get_env("WORKER_CONCURRENCY", "5")
     |> String.to_integer()
   end
 end

@@ -3,6 +3,7 @@ defmodule Dispatch.Coordinator.Router do
 
   use Plug.Router
 
+  alias Dispatch.Coordinator.JobGroup
   alias Dispatch.Coordinator.JobQueue
   alias Dispatch.Coordinator.RateLimiter
   alias Dispatch.Coordinator.JobStore
@@ -35,6 +36,32 @@ defmodule Dispatch.Coordinator.Router do
           {:error, reason} when is_binary(reason) -> json(conn, 422, %{error: reason})
           {:error, reason} -> redis_error(conn, reason)
         end
+    end
+  end
+
+  post "/job-groups" do
+    case JobGroup.create(conn.body_params) do
+      {:ok, group} ->
+        json(conn, 201, group)
+
+      {:error, reason} when is_binary(reason) ->
+        json(conn, 422, %{error: reason})
+
+      {:error, reason} ->
+        redis_error(conn, reason)
+    end
+  end
+
+  get "/job-groups/:group_id" do
+    case JobGroup.get(group_id) do
+      {:ok, group} ->
+        json(conn, 200, group)
+
+      {:error, :not_found} ->
+        json(conn, 404, %{error: "job group not found"})
+
+      {:error, reason} ->
+        redis_error(conn, reason)
     end
   end
 

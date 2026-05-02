@@ -11,7 +11,11 @@ defmodule ElixirAppTest do
         "status" => "success",
         "result" => "{}",
         "error" => "",
+        "inserted_at" => "2026-05-02T10:00:00Z",
+        "started_at" => "2026-05-02T10:00:02Z",
+        "finished_at" => "2026-05-02T10:00:07Z",
         "worker_name" => "findash-stocks-worker-1",
+        "group_id" => "group-1",
         "resources" => ~s({"api_slots":1,"memory_slots":1}),
         "worker_resources" => ~s({"api_slots":50,"memory_slots":8}),
         "rate_limit_key" => "fmp_api",
@@ -23,10 +27,14 @@ defmodule ElixirAppTest do
     assert status.worker_name == "findash-stocks-worker-1"
     assert status.resources == %{"api_slots" => 1, "memory_slots" => 1}
     assert status.worker_resources == %{"api_slots" => 50, "memory_slots" => 8}
+    assert status.group_id == "group-1"
     assert status.rate_limit_key == "fmp_api"
     assert status.rate_limit_cost == 1
     assert status.rate_limits == %{"fmp_api" => 1}
     assert status.rate_limit_wait_ms == 1000
+    assert status.queue_wait_ms == 2_000
+    assert status.worker_duration_ms == 5_000
+    assert status.result_size_bytes == 2
   end
 
   test "job status keeps worker attribution optional for old jobs" do
@@ -204,6 +212,89 @@ defmodule ElixirAppTest do
              worker_name: "worker-1",
              post_json: fn _path, _payload -> flunk("invalid cost should fail locally") end
            ) == {:error, "rate_limit_cost must be a positive integer"}
+  end
+
+  test "job group summary includes aggregate status, workers, metrics, and failures" do
+    jobs = [
+      %{
+        job_id: "job-1",
+        status: "success",
+        worker_name: "worker-a",
+        resources: %{"api_slots" => 1},
+        rate_limits: %{"provider_api" => 100},
+        rate_limit_wait_ms: 0,
+        queued_reason: nil,
+        queue_wait_ms: 1_000,
+        worker_duration_ms: 10_000,
+        result_size_bytes: 100,
+        error: nil
+      },
+      %{
+        job_id: "job-2",
+        status: "failed",
+        worker_name: "worker-b",
+        resources: %{"api_slots" => 1},
+        rate_limits: %{"provider_api" => 100},
+        rate_limit_wait_ms: 2_000,
+        queued_reason: nil,
+        queue_wait_ms: 2_000,
+        worker_duration_ms: 20_000,
+        result_size_bytes: nil,
+        error: "boom"
+      },
+      %{
+        job_id: "job-3",
+        status: "queued",
+        worker_name: nil,
+        resources: %{"api_slots" => 1},
+        rate_limits: %{"provider_api" => 100},
+        rate_limit_wait_ms: 1_000,
+        queued_reason: "group_concurrency_limit:group-1",
+        queue_wait_ms: nil,
+        worker_duration_ms: nil,
+        result_size_bytes: nil,
+        error: nil
+      }
+    ]
+
+    summary =
+      Dispatch.Coordinator.JobGroup.summarize(
+        "group-1",
+        %{"group_key" => "employee-count", "group_concurrency" => "2", "total_jobs" => "3"},
+        jobs
+      )
+
+    assert summary.group_id == "group-1"
+    assert summary.group_key == "employee-count"
+    assert summary.group_concurrency == 2
+    assert summary.status == "failed"
+    assert summary.counts["success"] == 1
+    assert summary.counts["failed"] == 1
+    assert summary.counts["queued"] == 1
+    assert summary.worker_split == %{"worker-a" => 1, "worker-b" => 1}
+    assert summary.metrics.queue_wait_ms.p50 == 1_000
+    assert summary.metrics.worker_duration_ms.p95 == 20_000
+    assert summary.metrics.rate_limit_wait_ms_total == 3_000
+    assert summary.failures == [%{job_id: "job-2", error: "boom", worker_name: "worker-b"}]
+    assert Enum.map(summary.jobs, & &1.job_id) == ["job-1", "job-2", "job-3"]
+    refute Map.has_key?(hd(summary.jobs), :result)
+  end
+
+  test "job group summary reports success only when all child jobs succeeded" do
+    summary =
+      Dispatch.Coordinator.JobGroup.summarize(
+        "group-1",
+        %{"group_key" => "", "group_concurrency" => "", "total_jobs" => "2"},
+        [
+          %{job_id: "job-1", status: "success"},
+          %{job_id: "job-2", status: "success"}
+        ]
+      )
+
+    assert summary.status == "success"
+    assert summary.group_key == nil
+    assert summary.group_concurrency == nil
+    assert summary.counts["success"] == 2
   end
 
   test "coordinator recovery threshold is configurable" do

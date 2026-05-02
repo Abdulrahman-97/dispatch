@@ -21,10 +21,12 @@ coordinator.
 ## What It Does
 
 - `POST /jobs` queues a job
+- `POST /job-groups` queues a batch of normal jobs and returns one group id
 - `POST /internal/poll` lets a worker atomically claim a job
 - workers execute `python/scripts/<job_type>.py`
 - `POST /internal/result` stores `success` or `failed`
 - `GET /jobs/:id` returns the current job status
+- `GET /job-groups/:id` returns aggregate status and timing metadata for a group
 - stuck `running` jobs are recovered back to the queue
 
 ## Non-Goals
@@ -91,7 +93,87 @@ Response:
   "rate_limits": {
     "provider_api": 1
   },
-  "rate_limit_wait_ms": 1000
+  "rate_limit_wait_ms": 1000,
+  "group_id": "uuid",
+  "queued_reason": "group_concurrency_limit:uuid",
+  "queue_wait_ms": 2000,
+  "worker_duration_ms": 5000,
+  "result_size_bytes": 1024
+}
+```
+
+Submit a job group:
+
+```http
+POST /job-groups
+content-type: application/json
+
+{
+  "group_key": "employee-count-2026-05-02",
+  "group_concurrency": 4,
+  "jobs": [
+    {
+      "job_type": "python_callable",
+      "params": {
+        "callable": "employee_count_chunk",
+        "resources": {
+          "api_slots": 1
+        },
+        "rate_limits": {
+          "provider_api": 200
+        },
+        "kwargs": {
+          "chunk_id": 1
+        }
+      }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "group_id": "uuid",
+  "job_ids": ["uuid"]
+}
+```
+
+Get group status:
+
+```http
+GET /job-groups/:id
+```
+
+Response:
+
+```json
+{
+  "group_id": "uuid",
+  "group_key": "employee-count-2026-05-02",
+  "group_concurrency": 4,
+  "status": "queued | running | success | failed",
+  "counts": {
+    "queued": 0,
+    "running": 1,
+    "success": 9,
+    "failed": 0
+  },
+  "worker_split": {
+    "worker-a": 5,
+    "worker-b": 5
+  },
+  "metrics": {
+    "queue_wait_ms": {
+      "min": 1000,
+      "p50": 2000,
+      "p95": 5000,
+      "max": 5000
+    },
+    "rate_limit_wait_ms_total": 0
+  },
+  "failures": []
 }
 ```
 
@@ -109,6 +191,8 @@ Redis keys:
 - `jobs:queue`: queued job ids
 - `jobs:processing`: claimed job ids currently running
 - `job:{id}`: job hash containing status, payload, result, error, timestamps, and worker name
+- `job_group:{id}`: group metadata for a batch of normal jobs
+- `job_group:{id}:jobs`: child job ids for a group
 
 State flow:
 
@@ -326,6 +410,32 @@ Resource keys are project-defined strings. Dispatch does not attach provider or 
 them. A job remains queued if no polling worker advertises the required keys or if all matching
 workers are currently full. `GET /jobs/:id` includes requested `resources`, assigned
 `worker_resources`, and `queued_reason` when available.
+
+## Job Groups
+
+Job groups are an operational primitive for clients that submit many related jobs. Dispatch does not
+split business inputs or understand what the jobs mean; the client decides the chunk size and sends a
+list of normal job requests.
+
+Use job groups when you want:
+
+- one `group_id` for a fanout run
+- aggregate status counts
+- worker split diagnostics
+- queue wait, worker duration, result size, and rate-limit wait summaries
+- optional `group_concurrency` so one large fanout cannot consume all worker capacity
+
+`group_concurrency` limits how many child jobs from the same group may be `running` at once. It is
+separate from worker resources and global rate limits. If omitted, all child jobs are scheduled using
+normal resource and rate-limit rules. If a child is blocked by the group cap, `GET /jobs/:id` shows a
+`queued_reason` like:
+
+```text
+group_concurrency_limit:<group_id>
+```
+
+The group endpoint intentionally returns child metadata, not child results. Fetch individual jobs
+with `GET /jobs/:id` when you need the stored result payload.
 
 ## Distributed Rate Limits
 

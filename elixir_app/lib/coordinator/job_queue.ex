@@ -1,30 +1,32 @@
 defmodule Dispatch.Coordinator.JobQueue do
   @moduledoc false
 
-  import Bitwise
-
   require Logger
 
   alias Dispatch.Coordinator.RateLimiter
   alias Dispatch.Coordinator.JobStore
   alias Dispatch.RateLimit
   alias Dispatch.Resources
+  alias Dispatch.UUID
 
   @queue_key "jobs:queue"
   @processing_key "jobs:processing"
   @redis_name Dispatch.Redis
 
-  def enqueue(job_type, params) do
-    job_id = generate_job_id()
+  def enqueue(job_type, params, attrs \\ %{}) do
+    job_id = UUID.generate()
     payload_json = Jason.encode!(%{job_type: job_type, params: params})
+    group_id = attrs["group_id"] || ""
 
     with {:ok, resources} <- Resources.requirements_from_params(params),
          {:ok, rate_limit_metadata} <- RateLimit.metadata_from_params(params),
          attrs =
            Map.merge(rate_limit_metadata, %{
-             "resources" => Resources.encode(resources)
+             "resources" => Resources.encode(resources),
+             "group_id" => group_id
            }),
          {:ok, _} <- JobStore.put_new(job_id, payload_json, attrs),
+         {:ok, _} <- maybe_add_group_job(group_id, job_id),
          {:ok, _} <- Redix.command(@redis_name, ["RPUSH", @queue_key, job_id]) do
       {:ok, job_id}
     end
@@ -104,6 +106,10 @@ defmodule Dispatch.Coordinator.JobQueue do
 
           :skip
 
+        {:error, {:group_limited, group_id}} ->
+          _ = JobStore.set_queue_diagnostic(job_id, "group_concurrency_limit:#{group_id}")
+          :skip
+
         other ->
           other
       end
@@ -165,17 +171,9 @@ defmodule Dispatch.Coordinator.JobQueue do
     end
   end
 
-  defp generate_job_id do
-    <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
-    version = bor(band(c, 0x0FFF), 0x4000)
-    variant = bor(band(d, 0x3FFF), 0x8000)
-
-    :io_lib.format(
-      "~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b",
-      [a, b, version, variant, e]
-    )
-    |> IO.iodata_to_binary()
-  end
+  defp maybe_add_group_job("", _job_id), do: {:ok, :ungrouped}
+  defp maybe_add_group_job(nil, _job_id), do: {:ok, :ungrouped}
+  defp maybe_add_group_job(group_id, job_id), do: JobStore.add_group_job(group_id, job_id)
 
   defp now_iso8601 do
     DateTime.utc_now()

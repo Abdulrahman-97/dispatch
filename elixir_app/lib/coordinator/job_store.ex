@@ -3,6 +3,7 @@ defmodule Dispatch.Coordinator.JobStore do
 
   @processing_key "jobs:processing"
   @queue_key "jobs:queue"
+  @group_prefix "job_group:"
   @redis_name Dispatch.Redis
   @claim_queued_script """
   local job_key = KEYS[1]
@@ -27,6 +28,29 @@ defmodule Dispatch.Coordinator.JobStore do
 
   if not redis.call("LPOS", queue_key, job_id) then
     return {"not_queued"}
+  end
+
+  local group_id = redis.call("HGET", job_key, "group_id")
+
+  if group_id and group_id ~= "" then
+    local group_key = "job_group:" .. group_id
+    local group_concurrency = tonumber(redis.call("HGET", group_key, "group_concurrency") or "0")
+
+    if group_concurrency and group_concurrency > 0 then
+      local group_jobs_key = "job_group:" .. group_id .. ":jobs"
+      local group_job_ids = redis.call("LRANGE", group_jobs_key, "0", "-1")
+      local running = 0
+
+      for _, group_job_id in ipairs(group_job_ids) do
+        if redis.call("HGET", "job:" .. group_job_id, "status") == "running" then
+          running = running + 1
+        end
+      end
+
+      if running >= group_concurrency then
+        return {"group_limited", group_id, tostring(running)}
+      end
+    end
   end
 
   for i = 1, rate_limit_count do
@@ -74,6 +98,8 @@ defmodule Dispatch.Coordinator.JobStore do
     worker_name,
     "worker_resources",
     worker_resources,
+    "group_id",
+    group_id or "",
     "queued_reason",
     ""
   )
@@ -254,9 +280,42 @@ defmodule Dispatch.Coordinator.JobStore do
       attrs["rate_limits"] || "",
       "worker_resources",
       "",
+      "group_id",
+      attrs["group_id"] || "",
       "queued_reason",
       ""
     ])
+  end
+
+  def put_group(group_id, attrs) do
+    Redix.command(@redis_name, [
+      "HSET",
+      group_key(group_id),
+      "group_key",
+      attrs["group_key"] || "",
+      "group_concurrency",
+      attrs["group_concurrency"] || "",
+      "total_jobs",
+      attrs["total_jobs"] || "0",
+      "inserted_at",
+      now_iso8601()
+    ])
+  end
+
+  def add_group_job(group_id, job_id) do
+    Redix.command(@redis_name, ["RPUSH", group_jobs_key(group_id), job_id])
+  end
+
+  def get_group(group_id) do
+    case Redix.command(@redis_name, ["HGETALL", group_key(group_id)]) do
+      {:ok, []} -> {:error, :not_found}
+      {:ok, fields} -> {:ok, fields_to_map(fields)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def group_job_ids(group_id) do
+    Redix.command(@redis_name, ["LRANGE", group_jobs_key(group_id), "0", "-1"])
   end
 
   def get(job_id) do
@@ -318,6 +377,9 @@ defmodule Dispatch.Coordinator.JobStore do
       {:ok, ["rate_limited", index | _rest]} ->
         entry = Enum.at(rate_limit_entries, String.to_integer(index) - 1)
         {:error, {:rate_limited, entry}}
+
+      {:ok, ["group_limited", group_id | _rest]} ->
+        {:error, {:group_limited, group_id}}
 
       {:ok, ["not_found"]} ->
         {:error, :not_found}
@@ -394,8 +456,11 @@ defmodule Dispatch.Coordinator.JobStore do
       rate_limit_wait_ms: normalize_integer_field(fields["rate_limit_wait_ms"]),
       resources: decode_json_field(fields["resources"]),
       worker_resources: decode_json_field(fields["worker_resources"]),
+      group_id: normalize_field(fields["group_id"]),
       queued_reason: normalize_field(fields["queued_reason"]),
-      queue_wait_ms: queue_wait_ms(fields["inserted_at"], fields["started_at"])
+      queue_wait_ms: duration_ms(fields["inserted_at"], fields["started_at"]),
+      worker_duration_ms: duration_ms(fields["started_at"], fields["finished_at"]),
+      result_size_bytes: result_size_bytes(fields["result"])
     }
   end
 
@@ -446,23 +511,28 @@ defmodule Dispatch.Coordinator.JobStore do
 
   defp decode_json_field(_value), do: nil
 
-  defp queue_wait_ms(inserted_at, started_at)
-       when is_binary(inserted_at) and is_binary(started_at) do
-    with {:ok, inserted, _offset} <- DateTime.from_iso8601(inserted_at),
-         {:ok, started, _offset} <- DateTime.from_iso8601(started_at) do
-      DateTime.diff(started, inserted, :millisecond)
+  defp result_size_bytes(value) when is_binary(value) and value != "", do: byte_size(value)
+  defp result_size_bytes(_value), do: nil
+
+  defp duration_ms(started_at, finished_at)
+       when is_binary(started_at) and is_binary(finished_at) do
+    with {:ok, started, _offset} <- DateTime.from_iso8601(started_at),
+         {:ok, finished, _offset} <- DateTime.from_iso8601(finished_at) do
+      DateTime.diff(finished, started, :millisecond)
     else
       _ -> nil
     end
   end
 
-  defp queue_wait_ms(_inserted_at, _started_at), do: nil
+  defp duration_ms(_started_at, _finished_at), do: nil
 
   defp transition(script, keys, args) do
     Redix.command(@redis_name, ["EVAL", script, Integer.to_string(length(keys)) | keys ++ args])
   end
 
   defp job_key(job_id), do: "job:#{job_id}"
+  defp group_key(group_id), do: "#{@group_prefix}#{group_id}"
+  defp group_jobs_key(group_id), do: "#{@group_prefix}#{group_id}:jobs"
 
   defp now_iso8601 do
     DateTime.utc_now()

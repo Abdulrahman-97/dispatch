@@ -8,6 +8,7 @@ defmodule ElixirAppTest do
   test "job status includes worker attribution when available" do
     status =
       Dispatch.Coordinator.JobStore.format_status("job-1", %{
+        "job_type" => "dagster_run",
         "status" => "success",
         "result" => "{}",
         "error" => "",
@@ -15,7 +16,15 @@ defmodule ElixirAppTest do
         "started_at" => "2026-05-02T10:00:02Z",
         "finished_at" => "2026-05-02T10:00:07Z",
         "worker_name" => "findash-stocks-worker-1",
+        "worker_version" => "0.1.0",
         "group_id" => "group-1",
+        "dagster_run_id" => "dagster-run-1",
+        "command" => ~s(["dagster","api","execute_run"]),
+        "image" => "stocks-worker:test",
+        "metadata" => ~s({"dagster_job_name":"daily_prices"}),
+        "exit_code" => "0",
+        "logs_tail" => "run finished",
+        "cancel_requested" => "0",
         "resources" => ~s({"api_slots":1,"memory_slots":1}),
         "worker_resources" => ~s({"api_slots":50,"memory_slots":8}),
         "rate_limit_key" => "fmp_api",
@@ -25,9 +34,18 @@ defmodule ElixirAppTest do
       })
 
     assert status.worker_name == "findash-stocks-worker-1"
+    assert status.worker_version == "0.1.0"
+    assert status.job_type == "dagster_run"
     assert status.resources == %{"api_slots" => 1, "memory_slots" => 1}
     assert status.worker_resources == %{"api_slots" => 50, "memory_slots" => 8}
     assert status.group_id == "group-1"
+    assert status.dagster_run_id == "dagster-run-1"
+    assert status.command == ["dagster", "api", "execute_run"]
+    assert status.image == "stocks-worker:test"
+    assert status.metadata == %{"dagster_job_name" => "daily_prices"}
+    assert status.exit_code == 0
+    assert status.logs_tail == "run finished"
+    refute status.cancel_requested
     assert status.rate_limit_key == "fmp_api"
     assert status.rate_limit_cost == 1
     assert status.rate_limits == %{"fmp_api" => 1}
@@ -214,6 +232,109 @@ defmodule ElixirAppTest do
            ) == {:error, "rate_limit_cost must be a positive integer"}
   end
 
+  test "dagster_run params validate command, env, image, and metadata" do
+    assert {:ok, normalized} =
+             Dispatch.Coordinator.DagsterRun.validate_params(%{
+               "dagster_run_id" => "run-1",
+               "command" => ["dagster", "api", "execute_run", "payload"],
+               "env" => %{"DAGSTER_HOME" => "/opt/dagster", "RETRY" => 1, "DEBUG" => false},
+               "image" => "stocks-worker:test",
+               "metadata" => %{"dagster_job_name" => "daily_prices"},
+               "resources" => %{"cpu_slots" => 1}
+             })
+
+    assert normalized["dagster_run_id"] == "run-1"
+    assert normalized["command"] == ["dagster", "api", "execute_run", "payload"]
+
+    assert normalized["env"] == %{
+             "DAGSTER_HOME" => "/opt/dagster",
+             "RETRY" => "1",
+             "DEBUG" => "false"
+           }
+
+    assert normalized["image"] == "stocks-worker:test"
+    assert normalized["metadata"] == %{"dagster_job_name" => "daily_prices"}
+    assert normalized["resources"] == %{"cpu_slots" => 1}
+  end
+
+  test "dagster_run params reject invalid command" do
+    assert Dispatch.Coordinator.DagsterRun.validate_params(%{
+             "dagster_run_id" => "run-1",
+             "command" => []
+           }) == {:error, "command must be a non-empty array of strings"}
+  end
+
+  test "idempotency returns existing job id for duplicate dagster run submissions" do
+    {:ok, agent} = Agent.start_link(fn -> %{} end)
+
+    try do
+      command = idempotency_command(agent)
+
+      assert Dispatch.Coordinator.Idempotency.reserve("dagster_run", "run-1", "job-1",
+               command: command
+             ) == {:ok, :reserved}
+
+      assert Dispatch.Coordinator.Idempotency.reserve("dagster_run", "run-1", "job-2",
+               command: command
+             ) == {:ok, {:existing, "job-1"}}
+    after
+      Agent.stop(agent)
+    end
+  end
+
+  test "dagster_run command success captures exit code and logs tail" do
+    result =
+      Dispatch.Worker.Executor.run(%{
+        "job_type" => "dagster_run",
+        "params" => %{
+          "dagster_run_id" => "run-1",
+          "command" => [python_executable(), "-c", ~s/print("dagster-ok", end="")/],
+          "env" => %{}
+        }
+      })
+
+    assert result["status"] == "success"
+    assert result["exit_code"] == 0
+    assert result["logs_tail"] == "dagster-ok"
+  end
+
+  test "running dagster_run cancellation terminates command and returns canceled status" do
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-1",
+            "command" => [python_executable(), "-c", "import time; time.sleep(5)"],
+            "env" => %{}
+          }
+        },
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 1,
+        cancel_timeout_ms: 100
+      )
+
+    assert result["status"] == "canceled"
+    assert result["error"] == "dagster_run canceled"
+  end
+
+  test "worker in draining mode does not poll for new jobs" do
+    refute Dispatch.Worker.Scheduler.should_poll?(%{
+             draining: true,
+             available: %{"default_slots" => 1}
+           })
+
+    assert Dispatch.Worker.Scheduler.should_poll?(%{
+             draining: false,
+             available: %{"default_slots" => 1}
+           })
+
+    refute Dispatch.Worker.Scheduler.should_poll?(%{
+             draining: false,
+             available: %{"default_slots" => 0}
+           })
+  end
+
   test "job group summary includes aggregate status, workers, metrics, and failures" do
     jobs = [
       %{
@@ -361,5 +482,34 @@ defmodule ElixirAppTest do
         end
       end)
     end
+  end
+
+  defp idempotency_command(agent) do
+    fn
+      ["SET", key, value, "NX"] ->
+        Agent.get_and_update(agent, fn state ->
+          if Map.has_key?(state, key) do
+            {{:ok, nil}, state}
+          else
+            {{:ok, "OK"}, Map.put(state, key, value)}
+          end
+        end)
+
+      ["GET", key] ->
+        {:ok, Agent.get(agent, &Map.get(&1, key))}
+
+      ["EVAL", _script, "1", key, value] ->
+        Agent.get_and_update(agent, fn state ->
+          if Map.get(state, key) == value do
+            {{:ok, 1}, Map.delete(state, key)}
+          else
+            {{:ok, 0}, state}
+          end
+        end)
+    end
+  end
+
+  defp python_executable do
+    System.find_executable("python") || System.find_executable("python3") || "python"
   end
 end

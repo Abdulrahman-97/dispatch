@@ -98,6 +98,8 @@ defmodule Dispatch.Coordinator.JobStore do
     worker_name,
     "worker_resources",
     worker_resources,
+    "worker_version",
+    ARGV[arg_index],
     "group_id",
     group_id or "",
     "queued_reason",
@@ -175,7 +177,132 @@ defmodule Dispatch.Coordinator.JobStore do
     redis.call("HSET", key, "rate_limit_wait_ms", ARGV[8])
   end
 
+  if ARGV[9] ~= "" then
+    redis.call("HSET", key, "exit_code", ARGV[9])
+  end
+
+  if ARGV[10] ~= "" then
+    redis.call("HSET", key, "logs_tail", ARGV[10])
+  end
+
+  if ARGV[11] ~= "" then
+    redis.call("HSET", key, "worker_version", ARGV[11])
+  end
+
   redis.call("LREM", processing_key, "1", ARGV[1])
+
+  return "ok"
+  """
+  @cancel_script """
+  local key = KEYS[1]
+  local queue_key = KEYS[2]
+  local status = redis.call("HGET", key, "status")
+
+  if not status then
+    return {"not_found"}
+  end
+
+  if status == "queued" then
+    redis.call("LREM", queue_key, "1", ARGV[1])
+    redis.call(
+      "HSET",
+      key,
+      "status",
+      "canceled",
+      "cancel_requested",
+      "1",
+      "cancel_requested_at",
+      ARGV[2],
+      "finished_at",
+      ARGV[2],
+      "error",
+      ARGV[3],
+      "queued_reason",
+      "canceled"
+    )
+
+    return {"canceled"}
+  end
+
+  if status == "running" then
+    redis.call(
+      "HSET",
+      key,
+      "cancel_requested",
+      "1",
+      "cancel_requested_at",
+      ARGV[2],
+      "queued_reason",
+      "cancel_requested"
+    )
+
+    return {"cancel_requested"}
+  end
+
+  return {"terminal", status}
+  """
+  @interrupt_script """
+  local key = KEYS[1]
+  local processing_key = KEYS[2]
+  local queue_key = KEYS[3]
+  local status = redis.call("HGET", key, "status")
+
+  if not status then
+    return "not_found"
+  end
+
+  if status ~= "running" then
+    return "invalid_transition:" .. status
+  end
+
+  if redis.call("HGET", key, "started_at") ~= ARGV[2] then
+    return "stale_attempt"
+  end
+
+  if redis.call("HGET", key, "cancel_requested") == "1" then
+    redis.call("LREM", processing_key, "1", ARGV[1])
+    redis.call(
+      "HSET",
+      key,
+      "status",
+      "canceled",
+      "finished_at",
+      ARGV[3],
+      "error",
+      "canceled before stuck-job recovery",
+      "queued_reason",
+      "canceled"
+    )
+
+    return "ok"
+  end
+
+  redis.call("LREM", processing_key, "1", ARGV[1])
+  redis.call("LPUSH", queue_key, ARGV[1])
+  redis.call(
+    "HSET",
+    key,
+    "status",
+    "queued",
+    "started_at",
+    "",
+    "finished_at",
+    "",
+    "result",
+    "",
+    "error",
+    ARGV[3],
+    "worker_name",
+    "",
+    "worker_resources",
+    "",
+    "worker_version",
+    "",
+    "cancel_requested",
+    "0",
+    "queued_reason",
+    "worker_interrupted"
+  )
 
   return "ok"
   """
@@ -197,6 +324,24 @@ defmodule Dispatch.Coordinator.JobStore do
     return "stale_attempt"
   end
 
+  if redis.call("HGET", key, "cancel_requested") == "1" then
+    redis.call("LREM", processing_key, "1", ARGV[1])
+    redis.call(
+      "HSET",
+      key,
+      "status",
+      "canceled",
+      "finished_at",
+      ARGV[3],
+      "error",
+      "canceled before stuck-job recovery",
+      "queued_reason",
+      "canceled"
+    )
+
+    return "ok"
+  end
+
   redis.call("LREM", processing_key, "1", ARGV[1])
   redis.call("LPUSH", queue_key, ARGV[1])
   redis.call(
@@ -216,7 +361,11 @@ defmodule Dispatch.Coordinator.JobStore do
     "",
     "worker_resources",
     "",
+    "worker_version",
+    "",
     "rate_limit_wait_ms",
+    "0",
+    "cancel_requested",
     "0",
     "queued_reason",
     "recovered_stuck_job"
@@ -254,6 +403,8 @@ defmodule Dispatch.Coordinator.JobStore do
       job_key(job_id),
       "status",
       "queued",
+      "job_type",
+      attrs["job_type"] || "",
       "payload",
       payload_json,
       "result",
@@ -279,6 +430,26 @@ defmodule Dispatch.Coordinator.JobStore do
       "rate_limits",
       attrs["rate_limits"] || "",
       "worker_resources",
+      "",
+      "worker_version",
+      attrs["worker_version"] || "",
+      "exit_code",
+      "",
+      "logs_tail",
+      "",
+      "dagster_run_id",
+      attrs["dagster_run_id"] || "",
+      "idempotency_key",
+      attrs["idempotency_key"] || "",
+      "command",
+      attrs["command"] || "",
+      "image",
+      attrs["image"] || "",
+      "metadata",
+      attrs["metadata"] || "",
+      "cancel_requested",
+      "0",
+      "cancel_requested_at",
       "",
       "group_id",
       attrs["group_id"] || "",
@@ -349,7 +520,14 @@ defmodule Dispatch.Coordinator.JobStore do
     end
   end
 
-  def claim_queued(job_id, started_at, worker_name, worker_resources, rate_limit_entries) do
+  def claim_queued(
+        job_id,
+        started_at,
+        worker_name,
+        worker_resources,
+        rate_limit_entries,
+        worker_version \\ nil
+      ) do
     keys =
       [job_key(job_id), @queue_key, @processing_key] ++
         Enum.map(rate_limit_entries, & &1.redis_key)
@@ -368,7 +546,8 @@ defmodule Dispatch.Coordinator.JobStore do
             Integer.to_string(entry.cost),
             Integer.to_string(entry.ttl)
           ]
-        end)
+        end) ++
+        [normalize_field_for_storage(worker_version)]
 
     case transition(@claim_queued_script, keys, args) do
       {:ok, ["ok"]} ->
@@ -407,10 +586,41 @@ defmodule Dispatch.Coordinator.JobStore do
              attrs["error"] || "",
              now_iso8601(),
              normalize_worker_name(attrs["worker_name"]),
-             normalize_non_negative_integer(attrs["rate_limit_wait_ms"])
+             normalize_non_negative_integer(attrs["rate_limit_wait_ms"]),
+             normalize_integer_for_storage(attrs["exit_code"]),
+             normalize_field_for_storage(attrs["logs_tail"]),
+             normalize_field_for_storage(attrs["worker_version"])
            ]
          ) do
       {:ok, "ok"} -> {:ok, :completed}
+      {:ok, "not_found"} -> {:error, :not_found}
+      {:ok, "stale_attempt"} -> {:error, :stale_attempt}
+      {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def cancel(job_id, reason \\ "canceled by request") do
+    case transition(@cancel_script, [job_key(job_id), @queue_key], [
+           job_id,
+           now_iso8601(),
+           reason
+         ]) do
+      {:ok, ["canceled"]} -> {:ok, :canceled}
+      {:ok, ["cancel_requested"]} -> {:ok, :cancel_requested}
+      {:ok, ["terminal", status]} -> {:ok, {:already_terminal, status}}
+      {:ok, ["not_found"]} -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def interrupt(job_id, started_at, reason) do
+    case transition(
+           @interrupt_script,
+           [job_key(job_id), @processing_key, @queue_key],
+           [job_id, started_at, reason]
+         ) do
+      {:ok, "ok"} -> {:ok, :interrupted}
       {:ok, "not_found"} -> {:error, :not_found}
       {:ok, "stale_attempt"} -> {:error, :stale_attempt}
       {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
@@ -422,7 +632,7 @@ defmodule Dispatch.Coordinator.JobStore do
     case transition(
            @requeue_stuck_script,
            [job_key(job_id), @processing_key, @queue_key],
-           [job_id, started_at]
+           [job_id, started_at, now_iso8601()]
          ) do
       {:ok, "ok"} -> {:ok, :requeued}
       {:ok, "not_found"} -> {:error, :not_found}
@@ -446,6 +656,7 @@ defmodule Dispatch.Coordinator.JobStore do
   def format_status(job_id, fields) do
     %{
       job_id: job_id,
+      job_type: normalize_field(fields["job_type"]),
       status: fields["status"],
       result: normalize_field(fields["result"]),
       error: normalize_field(fields["error"]),
@@ -456,6 +667,17 @@ defmodule Dispatch.Coordinator.JobStore do
       rate_limit_wait_ms: normalize_integer_field(fields["rate_limit_wait_ms"]),
       resources: decode_json_field(fields["resources"]),
       worker_resources: decode_json_field(fields["worker_resources"]),
+      started_at: normalize_field(fields["started_at"]),
+      finished_at: normalize_field(fields["finished_at"]),
+      dagster_run_id: normalize_field(fields["dagster_run_id"]),
+      command: decode_json_field(fields["command"]),
+      image: normalize_field(fields["image"]),
+      metadata: decode_json_field(fields["metadata"]),
+      exit_code: normalize_integer_field(fields["exit_code"]),
+      logs_tail: normalize_field(fields["logs_tail"]),
+      worker_version: normalize_field(fields["worker_version"]),
+      cancel_requested: fields["cancel_requested"] == "1",
+      cancel_requested_at: normalize_field(fields["cancel_requested_at"]),
       group_id: normalize_field(fields["group_id"]),
       queued_reason: normalize_field(fields["queued_reason"]),
       queue_wait_ms: duration_ms(fields["inserted_at"], fields["started_at"]),
@@ -480,6 +702,11 @@ defmodule Dispatch.Coordinator.JobStore do
   defp normalize_worker_name(value) when is_binary(value), do: String.trim(value)
   defp normalize_worker_name(_value), do: ""
 
+  defp normalize_field_for_storage(value) when is_binary(value), do: value
+  defp normalize_field_for_storage(value) when is_integer(value), do: Integer.to_string(value)
+  defp normalize_field_for_storage(value) when is_float(value), do: Float.to_string(value)
+  defp normalize_field_for_storage(_value), do: ""
+
   defp normalize_non_negative_integer(value) when is_integer(value) and value >= 0 do
     Integer.to_string(value)
   end
@@ -492,6 +719,17 @@ defmodule Dispatch.Coordinator.JobStore do
   end
 
   defp normalize_non_negative_integer(_value), do: ""
+
+  defp normalize_integer_for_storage(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp normalize_integer_for_storage(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} -> Integer.to_string(integer)
+      _ -> ""
+    end
+  end
+
+  defp normalize_integer_for_storage(_value), do: ""
 
   defp normalize_integer_field(value) when is_binary(value) do
     case Integer.parse(value) do

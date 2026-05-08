@@ -33,9 +33,29 @@ defmodule Dispatch.Coordinator.Router do
       true ->
         case JobQueue.enqueue(job_type, params) do
           {:ok, job_id} -> json(conn, 201, %{job_id: job_id})
+          {:ok, job_id, :existing} -> json(conn, 200, %{job_id: job_id, existing: true})
           {:error, reason} when is_binary(reason) -> json(conn, 422, %{error: reason})
           {:error, reason} -> redis_error(conn, reason)
         end
+    end
+  end
+
+  post "/jobs/:job_id/cancel" do
+    case JobStore.cancel(job_id) do
+      {:ok, :canceled} ->
+        json(conn, 200, %{job_id: job_id, status: "canceled", cancellation: "applied"})
+
+      {:ok, :cancel_requested} ->
+        json(conn, 202, %{job_id: job_id, status: "running", cancellation: "requested"})
+
+      {:ok, {:already_terminal, status}} ->
+        json(conn, 200, %{job_id: job_id, status: status, cancellation: "already_terminal"})
+
+      {:error, :not_found} ->
+        json(conn, 404, %{error: "job not found"})
+
+      {:error, reason} ->
+        redis_error(conn, reason)
     end
   end
 
@@ -84,19 +104,47 @@ defmodule Dispatch.Coordinator.Router do
 
     worker_resources = Map.get(conn.body_params, "resource_capacity", available_resources)
 
-    case JobQueue.claim_next(
-           conn.body_params["worker_name"],
-           available_resources,
-           worker_resources
-         ) do
-      {:ok, job} ->
-        json(conn, 200, job)
+    if conn.body_params["draining"] == true do
+      send_resp(conn, 204, "")
+    else
+      case JobQueue.claim_next(
+             conn.body_params["worker_name"],
+             available_resources,
+             worker_resources,
+             conn.body_params["worker_version"]
+           ) do
+        {:ok, job} ->
+          json(conn, 200, job)
 
-      :empty ->
-        send_resp(conn, 204, "")
+        :empty ->
+          send_resp(conn, 204, "")
 
-      {:error, reason} ->
-        redis_error(conn, reason)
+        {:error, reason} ->
+          redis_error(conn, reason)
+      end
+    end
+  end
+
+  post "/internal/interrupted" do
+    job_id = conn.body_params["job_id"]
+    started_at = conn.body_params["started_at"]
+    reason = conn.body_params["reason"] || "worker interrupted"
+
+    cond do
+      not is_binary(job_id) or job_id == "" ->
+        json(conn, 422, %{error: "job_id is required"})
+
+      not is_binary(started_at) or started_at == "" ->
+        json(conn, 422, %{error: "started_at is required"})
+
+      true ->
+        case JobStore.interrupt(job_id, started_at, reason) do
+          {:ok, :interrupted} -> send_resp(conn, 204, "")
+          {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})
+          {:error, :invalid_transition} -> json(conn, 409, %{error: "invalid job state"})
+          {:error, :not_found} -> json(conn, 404, %{error: "job not found"})
+          {:error, reason} -> redis_error(conn, reason)
+        end
     end
   end
 
@@ -140,8 +188,8 @@ defmodule Dispatch.Coordinator.Router do
       not is_binary(started_at) or started_at == "" ->
         json(conn, 422, %{error: "started_at is required"})
 
-      status not in ["success", "failed"] ->
-        json(conn, 422, %{error: "status must be success or failed"})
+      status not in ["success", "failed", "canceled"] ->
+        json(conn, 422, %{error: "status must be success, failed, or canceled"})
 
       true ->
         case JobStore.get(job_id) do
@@ -151,7 +199,10 @@ defmodule Dispatch.Coordinator.Router do
                    "result" => result,
                    "error" => error,
                    "worker_name" => worker_name,
-                   "rate_limit_wait_ms" => conn.body_params["rate_limit_wait_ms"]
+                   "rate_limit_wait_ms" => conn.body_params["rate_limit_wait_ms"],
+                   "exit_code" => conn.body_params["exit_code"],
+                   "logs_tail" => conn.body_params["logs_tail"],
+                   "worker_version" => conn.body_params["worker_version"]
                  }) do
               {:ok, _} -> send_resp(conn, 204, "")
               {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})

@@ -21,9 +21,10 @@ coordinator.
 ## What It Does
 
 - `POST /jobs` queues a job
+- `POST /jobs/:id/cancel` cancels a queued job or requests cancellation for a running job
 - `POST /job-groups` queues a batch of normal jobs and returns one group id
 - `POST /internal/poll` lets a worker atomically claim a job
-- workers execute `python/scripts/<job_type>.py`
+- workers execute `python/scripts/<job_type>.py`, `python_callable`, or `dagster_run`
 - `POST /internal/result` stores `success` or `failed`
 - `GET /jobs/:id` returns the current job status
 - `GET /job-groups/:id` returns aggregate status and timing metadata for a group
@@ -76,7 +77,8 @@ Response:
 ```json
 {
   "job_id": "uuid",
-  "status": "queued | running | success | failed",
+  "job_type": "dagster_run",
+  "status": "queued | running | success | failed | canceled",
   "result": "...",
   "error": "...",
   "worker_name": "worker-1",
@@ -94,6 +96,16 @@ Response:
     "provider_api": 1
   },
   "rate_limit_wait_ms": 1000,
+  "dagster_run_id": "dagster-run-id",
+  "command": ["dagster", "api", "execute_run"],
+  "image": "optional-image-or-version",
+  "metadata": {
+    "dagster_job_name": "daily_prices"
+  },
+  "exit_code": 0,
+  "logs_tail": "...",
+  "worker_version": "0.1.0",
+  "cancel_requested": false,
   "group_id": "uuid",
   "queued_reason": "group_concurrency_limit:uuid",
   "queue_wait_ms": 2000,
@@ -209,6 +221,8 @@ Reliability behavior:
 - running and completed jobs include `worker_name` when claimed by a modern worker
 - the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
 - stale worker results are rejected if a job was already recovered and restarted
+- `dagster_run` submissions are idempotent by `dagster_run_id`
+- queued jobs can be canceled directly; running jobs receive a cooperative cancellation request
 
 The queue-to-processing move is atomic without blocking the coordinator HTTP request. If a worker
 process dies after receiving a job, recovery can still find the job id in `jobs:processing` and
@@ -365,6 +379,71 @@ The callable must:
 - raise an exception for failure
 
 The worker stores the callable return value as the job `result`.
+
+## Dagster Run Jobs
+
+`dagster_run` is the Dispatch job type intended for a custom Dagster `RunLauncher`. It is different
+from `python_callable`:
+
+- `python_callable` runs an allowlisted business callable inside an existing Dagster run.
+- `dagster_run` runs the whole Dagster run command that Dagster provides.
+
+Submit:
+
+```json
+{
+  "job_type": "dagster_run",
+  "params": {
+    "dagster_run_id": "826f6b0c-4d37-40b2-80a8-95b83f9de19c",
+    "command": ["dagster", "api", "execute_run", "..."],
+    "env": {
+      "DAGSTER_HOME": "/opt/dagster"
+    },
+    "image": "stocks-worker:2026-05-08",
+    "metadata": {
+      "dagster_job_name": "daily_prices",
+      "dagster_code_location": "stocks",
+      "dagster_repository": "__repository__"
+    }
+  }
+}
+```
+
+Behavior:
+
+- Dispatch executes `command` exactly as an executable plus args; it does not use a shell.
+- The worker environment must already contain the Dagster project, dependencies, and config needed
+  to run the command.
+- `env` is added to the worker process environment. Treat it as sensitive because the full job
+  payload is stored in Redis.
+- Re-submitting the same `dagster_run_id` returns the existing Dispatch `job_id` instead of creating
+  a duplicate job.
+- `GET /jobs/:id` exposes `dagster_run_id`, `command`, `image`, `metadata`, `exit_code`,
+  `logs_tail`, `worker_name`, and `worker_version`.
+
+Cancellation:
+
+```http
+POST /jobs/:id/cancel
+```
+
+Responses:
+
+- queued job: `200` with `cancellation: "applied"` and terminal `status: "canceled"`
+- running job: `202` with `cancellation: "requested"`; the worker terminates the subprocess and
+  reports `status: "canceled"`
+- terminal job: `200` with `cancellation: "already_terminal"`
+- missing job: `404`
+
+Operational requirements for a Dagster RunLauncher:
+
+- Use Postgres-backed Dagster instance storage shared by the webserver, daemon, and Dispatch worker.
+  Do not use local SQLite inside the worker container.
+- Provide the same `DAGSTER_HOME` / `dagster.yaml` and storage env vars the normal Dagster runtime
+  uses.
+- Provide any project secrets and dependencies required by the submitted run.
+- Deploy workers with graceful shutdown when possible. On `SIGTERM`, Dispatch workers stop polling
+  and attempt to requeue interrupted running jobs before exiting.
 
 ## Resource-Pool Scheduling
 

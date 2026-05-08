@@ -3,6 +3,8 @@ defmodule Dispatch.Coordinator.JobQueue do
 
   require Logger
 
+  alias Dispatch.Coordinator.DagsterRun
+  alias Dispatch.Coordinator.Idempotency
   alias Dispatch.Coordinator.RateLimiter
   alias Dispatch.Coordinator.JobStore
   alias Dispatch.RateLimit
@@ -15,13 +17,19 @@ defmodule Dispatch.Coordinator.JobQueue do
 
   def enqueue(job_type, params, attrs \\ %{}) do
     job_id = UUID.generate()
-    payload_json = Jason.encode!(%{job_type: job_type, params: params})
     group_id = attrs["group_id"] || ""
 
-    with {:ok, resources} <- Resources.requirements_from_params(params),
-         {:ok, rate_limit_metadata} <- RateLimit.metadata_from_params(params),
+    with {:ok, normalized_params, job_attrs} <- normalize_job(job_type, params),
+         {:ok, :reserved} <- reserve_idempotency(job_type, normalized_params, job_id),
+         payload_json = Jason.encode!(%{job_type: job_type, params: normalized_params}),
+         {:ok, resources} <- Resources.requirements_from_params(normalized_params),
+         {:ok, rate_limit_metadata} <- RateLimit.metadata_from_params(normalized_params),
          attrs =
-           Map.merge(rate_limit_metadata, %{
+           attrs
+           |> Map.merge(rate_limit_metadata)
+           |> Map.merge(job_attrs)
+           |> Map.merge(%{
+             "job_type" => job_type,
              "resources" => Resources.encode(resources),
              "group_id" => group_id
            }),
@@ -29,13 +37,21 @@ defmodule Dispatch.Coordinator.JobQueue do
          {:ok, _} <- maybe_add_group_job(group_id, job_id),
          {:ok, _} <- Redix.command(@redis_name, ["RPUSH", @queue_key, job_id]) do
       {:ok, job_id}
+    else
+      {:ok, {:existing, existing_job_id}} ->
+        {:ok, existing_job_id, :existing}
+
+      {:error, _reason} = error ->
+        _ = release_idempotency(job_type, params, job_id)
+        error
     end
   end
 
   def claim_next(
         worker_name \\ nil,
         available_resources \\ %{"default_slots" => 1},
-        worker_resources \\ nil
+        worker_resources \\ nil,
+        worker_version \\ nil
       ) do
     worker_resources = worker_resources || available_resources
 
@@ -51,7 +67,8 @@ defmodule Dispatch.Coordinator.JobQueue do
             job_ids,
             worker_name,
             normalized_available,
-            normalized_worker_resources
+            normalized_worker_resources,
+            worker_version
           )
 
         {:error, reason} ->
@@ -68,11 +85,23 @@ defmodule Dispatch.Coordinator.JobQueue do
     Redix.command(@redis_name, ["LREM", @processing_key, "1", job_id])
   end
 
-  defp claim_first_matching(job_ids, worker_name, available_resources, worker_resources) do
+  defp claim_first_matching(
+         job_ids,
+         worker_name,
+         available_resources,
+         worker_resources,
+         worker_version
+       ) do
     job_ids
     |> Enum.reverse()
     |> Enum.reduce_while(:empty, fn job_id, _acc ->
-      case maybe_claim_job(job_id, worker_name, available_resources, worker_resources) do
+      case maybe_claim_job(
+             job_id,
+             worker_name,
+             available_resources,
+             worker_resources,
+             worker_version
+           ) do
         :skip -> {:cont, :empty}
         :empty -> {:cont, :empty}
         {:ok, job} -> {:halt, {:ok, job}}
@@ -83,7 +112,7 @@ defmodule Dispatch.Coordinator.JobQueue do
     end)
   end
 
-  defp maybe_claim_job(job_id, worker_name, available_resources, worker_resources) do
+  defp maybe_claim_job(job_id, worker_name, available_resources, worker_resources, worker_version) do
     with {:ok, payload} <- JobStore.payload(job_id),
          params when is_map(params) <- Map.get(payload, "params", %{}),
          {:ok, requirements} <- Resources.requirements_from_params(params),
@@ -92,7 +121,14 @@ defmodule Dispatch.Coordinator.JobQueue do
          {:ok, rate_entries} <- RateLimiter.entries_for_specs(rate_specs) do
       started_at = now_iso8601()
 
-      case JobStore.claim_queued(job_id, started_at, worker_name, worker_resources, rate_entries) do
+      case JobStore.claim_queued(
+             job_id,
+             started_at,
+             worker_name,
+             worker_resources,
+             rate_entries,
+             worker_version
+           ) do
         {:ok, :running} ->
           claimed_job(job_id, started_at, worker_name, requirements)
 
@@ -174,6 +210,27 @@ defmodule Dispatch.Coordinator.JobQueue do
   defp maybe_add_group_job("", _job_id), do: {:ok, :ungrouped}
   defp maybe_add_group_job(nil, _job_id), do: {:ok, :ungrouped}
   defp maybe_add_group_job(group_id, job_id), do: JobStore.add_group_job(group_id, job_id)
+
+  defp normalize_job("dagster_run", params) do
+    with {:ok, normalized_params} <- DagsterRun.validate_params(params) do
+      {:ok, normalized_params, DagsterRun.attrs(normalized_params)}
+    end
+  end
+
+  defp normalize_job(_job_type, params) when is_map(params), do: {:ok, params, %{}}
+  defp normalize_job(_job_type, _params), do: {:error, "params must be a JSON object"}
+
+  defp reserve_idempotency("dagster_run", %{"dagster_run_id" => dagster_run_id}, job_id) do
+    Idempotency.reserve("dagster_run", dagster_run_id, job_id)
+  end
+
+  defp reserve_idempotency(_job_type, _params, _job_id), do: {:ok, :reserved}
+
+  defp release_idempotency("dagster_run", %{"dagster_run_id" => dagster_run_id}, job_id) do
+    Idempotency.release("dagster_run", dagster_run_id, job_id)
+  end
+
+  defp release_idempotency(_job_type, _params, _job_id), do: {:ok, :skipped}
 
   defp now_iso8601 do
     DateTime.utc_now()

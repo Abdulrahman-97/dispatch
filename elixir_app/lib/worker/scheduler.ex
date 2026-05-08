@@ -15,8 +15,14 @@ defmodule Dispatch.Worker.Scheduler do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  def should_poll?(%{draining: true}), do: false
+  def should_poll?(%{available: available}), do: any_available?(available)
+
   @impl true
   def init(_opts) do
+    Process.flag(:trap_exit, true)
+    :os.set_signal(:sigterm, :handle)
+
     capacity = worker_capacity!()
 
     state = %{
@@ -24,7 +30,10 @@ defmodule Dispatch.Worker.Scheduler do
       available: capacity,
       poll_interval_ms: poll_interval_ms(),
       coordinator_url: coordinator_url(),
-      worker_name: worker_name()
+      worker_name: worker_name(),
+      worker_version: worker_version(),
+      running: %{},
+      draining: false
     }
 
     Logger.info("worker=#{state.worker_name} resources=#{inspect(capacity)}")
@@ -34,7 +43,7 @@ defmodule Dispatch.Worker.Scheduler do
 
   @impl true
   def handle_info(:poll, state) do
-    if any_available?(state.available) do
+    if should_poll?(state) do
       case poll_once(state) do
         {:job_started, new_state} ->
           Process.send_after(self(), :poll, 0)
@@ -56,12 +65,14 @@ defmodule Dispatch.Worker.Scheduler do
 
   def handle_info({:job_finished, job, requirements, result}, state) do
     state = %{state | available: Resources.add(state.available, requirements, state.capacity)}
+    state = %{state | running: Map.delete(state.running, job["job_id"])}
 
     payload =
       result
       |> Map.put("job_id", job["job_id"])
       |> Map.put("started_at", job["started_at"])
       |> Map.put("worker_name", state.worker_name)
+      |> Map.put("worker_version", state.worker_version)
 
     case post_json(state.coordinator_url, "/internal/result", payload) do
       {:ok, 204, _body} ->
@@ -87,9 +98,32 @@ defmodule Dispatch.Worker.Scheduler do
     {:noreply, state}
   end
 
+  def handle_info({:signal, :sigterm}, state) do
+    Logger.warning("worker=#{state.worker_name} draining reason=sigterm")
+    {:noreply, %{state | draining: true}}
+  end
+
+  @impl true
+  def terminate(reason, state) do
+    Enum.each(state.running, fn {_job_id, job} ->
+      payload = %{
+        "job_id" => job["job_id"],
+        "started_at" => job["started_at"],
+        "worker_name" => state.worker_name,
+        "reason" => "worker interrupted: #{inspect(reason)}"
+      }
+
+      _ = post_json(state.coordinator_url, "/internal/interrupted", payload)
+    end)
+
+    :ok
+  end
+
   defp poll_once(state) do
     payload = %{
       "worker_name" => state.worker_name,
+      "worker_version" => state.worker_version,
+      "draining" => state.draining,
       "resource_capacity" => state.capacity,
       "available_resources" => state.available
     }
@@ -104,10 +138,15 @@ defmodule Dispatch.Worker.Scheduler do
           parent = self()
 
           Task.start(fn ->
-            send(parent, {:job_finished, job, requirements, safe_execute(job)})
+            send(parent, {:job_finished, job, requirements, safe_execute(job, state)})
           end)
 
-          {:job_started, %{state | available: Resources.subtract(state.available, requirements)}}
+          {:job_started,
+           %{
+             state
+             | available: Resources.subtract(state.available, requirements),
+               running: Map.put(state.running, job["job_id"], job)
+           }}
         else
           false ->
             Logger.error(
@@ -137,9 +176,11 @@ defmodule Dispatch.Worker.Scheduler do
     end
   end
 
-  defp safe_execute(job) do
+  defp safe_execute(job, state) do
     try do
-      Executor.run(job)
+      Executor.run(job,
+        cancel_check: fn -> cancel_requested?(state.coordinator_url, job["job_id"]) end
+      )
     rescue
       exception ->
         %{
@@ -157,6 +198,20 @@ defmodule Dispatch.Worker.Scheduler do
     end
   end
 
+  defp cancel_requested?(coordinator_url, job_id) do
+    case get_json(coordinator_url, "/jobs/#{job_id}") do
+      {:ok, 200, body} ->
+        case Jason.decode(body) do
+          {:ok, %{"cancel_requested" => true}} -> true
+          {:ok, %{"status" => "canceled"}} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
   defp post_json(base_url, path, payload) do
     url = to_charlist(String.trim_trailing(base_url, "/") <> path)
     body = Jason.encode!(payload)
@@ -168,6 +223,18 @@ defmodule Dispatch.Worker.Scheduler do
            @http_options,
            @request_options
          ) do
+      {:ok, {{_version, status, _reason_phrase}, _headers, response_body}} ->
+        {:ok, status, response_body}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp get_json(base_url, path) do
+    url = to_charlist(String.trim_trailing(base_url, "/") <> path)
+
+    case :httpc.request(:get, {url, []}, @http_options, @request_options) do
       {:ok, {{_version, status, _reason_phrase}, _headers, response_body}} ->
         {:ok, status, response_body}
 
@@ -201,5 +268,10 @@ defmodule Dispatch.Worker.Scheduler do
 
   defp worker_name do
     System.get_env("WORKER_NAME") || "worker-1"
+  end
+
+  defp worker_version do
+    System.get_env("DISPATCH_WORKER_VERSION") ||
+      to_string(Application.spec(:elixir_app, :vsn))
   end
 end

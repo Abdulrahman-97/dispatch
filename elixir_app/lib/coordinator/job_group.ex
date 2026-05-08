@@ -122,6 +122,7 @@ defmodule Dispatch.Coordinator.JobGroup do
     |> Enum.reduce_while({:ok, []}, fn job, {:ok, acc} ->
       case JobQueue.enqueue(job.job_type, job.params, %{"group_id" => group_id}) do
         {:ok, job_id} -> {:cont, {:ok, [job_id | acc]}}
+        {:ok, job_id, :existing} -> {:cont, {:ok, [job_id | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)

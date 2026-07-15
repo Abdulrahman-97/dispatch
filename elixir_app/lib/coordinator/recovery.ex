@@ -44,10 +44,13 @@ defmodule Dispatch.Coordinator.Recovery do
     with {:ok, job} <- JobStore.get(job_id),
          "running" <- job["status"],
          started_at when is_binary(started_at) <- JobStore.processing_started_at(job),
-         true <- older_than_threshold?(started_at, now, stuck_after_seconds()) do
+         heartbeat_at when is_binary(heartbeat_at) <- JobStore.processing_heartbeat_at(job),
+         true <- older_than_threshold?(heartbeat_at, now, stuck_after_seconds()) do
       case JobStore.requeue_stuck(job_id, started_at) do
         {:ok, :requeued} ->
-          Logger.warning("recovery_requeued job=#{job_id} started_at=#{started_at}")
+          Logger.warning(
+            "recovery_requeued job=#{job_id} started_at=#{started_at} heartbeat_at=#{heartbeat_at}"
+          )
 
         {:error, :stale_attempt} ->
           :ok

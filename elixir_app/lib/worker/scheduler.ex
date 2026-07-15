@@ -179,7 +179,13 @@ defmodule Dispatch.Worker.Scheduler do
   defp safe_execute(job, state) do
     try do
       Executor.run(job,
-        cancel_check: fn -> cancel_requested?(state.coordinator_url, job["job_id"]) end
+        cancel_check: fn ->
+          attempt_should_stop?(
+            state.coordinator_url,
+            job["job_id"],
+            job["started_at"]
+          )
+        end
       )
     rescue
       exception ->
@@ -198,17 +204,14 @@ defmodule Dispatch.Worker.Scheduler do
     end
   end
 
-  defp cancel_requested?(coordinator_url, job_id) do
-    case get_json(coordinator_url, "/jobs/#{job_id}") do
-      {:ok, 200, body} ->
-        case Jason.decode(body) do
-          {:ok, %{"cancel_requested" => true}} -> true
-          {:ok, %{"status" => "canceled"}} -> true
-          _ -> false
-        end
-
-      _ ->
-        false
+  defp attempt_should_stop?(coordinator_url, job_id, started_at) do
+    case post_json(coordinator_url, "/internal/heartbeat", %{
+           "job_id" => job_id,
+           "started_at" => started_at
+         }) do
+      {:ok, 204, _body} -> false
+      {:ok, 409, _body} -> true
+      _ -> false
     end
   end
 
@@ -223,18 +226,6 @@ defmodule Dispatch.Worker.Scheduler do
            @http_options,
            @request_options
          ) do
-      {:ok, {{_version, status, _reason_phrase}, _headers, response_body}} ->
-        {:ok, status, response_body}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp get_json(base_url, path) do
-    url = to_charlist(String.trim_trailing(base_url, "/") <> path)
-
-    case :httpc.request(:get, {url, []}, @http_options, @request_options) do
       {:ok, {{_version, status, _reason_phrase}, _headers, response_body}} ->
         {:ok, status, response_body}
 

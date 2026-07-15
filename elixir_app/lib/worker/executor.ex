@@ -3,6 +3,7 @@ defmodule Dispatch.Worker.Executor do
 
   @dagster_cancel_check_interval_ms 500
   @dagster_cancel_timeout_ms 5_000
+  @default_dagster_run_timeout_seconds 21_600
   @logs_tail_bytes 16_384
   @runner """
   import json
@@ -56,8 +57,14 @@ defmodule Dispatch.Worker.Executor do
     with [executable | args] <- Map.get(params, "command"),
          true <- is_binary(executable),
          true <- Enum.all?(args, &is_binary/1),
-         env when is_map(env) <- Map.get(params, "env", %{}) do
-      execute_dagster_command(executable, args, env, opts)
+         env when is_map(env) <- Map.get(params, "env", %{}),
+         {:ok, timeout_ms} <- dagster_run_timeout_ms(params) do
+      execute_dagster_command(
+        executable,
+        args,
+        env,
+        Keyword.put_new(opts, :execution_timeout_ms, timeout_ms)
+      )
     else
       _ -> failed_result("invalid dagster_run payload")
     end
@@ -81,10 +88,10 @@ defmodule Dispatch.Worker.Executor do
         env: env
       ])
 
-    wait_for_port(port, command, opts, "")
+    wait_for_port(port, command, opts, "", System.monotonic_time(:millisecond))
   end
 
-  defp wait_for_port(port, command, opts, logs_tail) do
+  defp wait_for_port(port, command, opts, logs_tail, started_at_ms) do
     cancel_check = Keyword.get(opts, :cancel_check, fn -> false end)
 
     cancel_interval_ms =
@@ -92,17 +99,49 @@ defmodule Dispatch.Worker.Executor do
 
     receive do
       {^port, {:data, data}} ->
-        wait_for_port(port, command, opts, append_tail(logs_tail, data))
+        wait_for_port(port, command, opts, append_tail(logs_tail, data), started_at_ms)
 
       {^port, {:exit_status, exit_code}} ->
         dagster_result(exit_code, logs_tail)
     after
       cancel_interval_ms ->
-        if cancel_check.() do
-          cancel_port(port, command, opts, logs_tail)
-        else
-          wait_for_port(port, command, opts, logs_tail)
+        cond do
+          execution_timed_out?(opts, started_at_ms) ->
+            timeout_port(port, command, opts, logs_tail)
+
+          cancel_check.() ->
+            cancel_port(port, command, opts, logs_tail)
+
+          true ->
+            wait_for_port(port, command, opts, logs_tail, started_at_ms)
         end
+    end
+  end
+
+  defp execution_timed_out?(opts, started_at_ms) do
+    timeout_ms = Keyword.fetch!(opts, :execution_timeout_ms)
+    System.monotonic_time(:millisecond) - started_at_ms >= timeout_ms
+  end
+
+  defp timeout_port(port, command, opts, logs_tail) do
+    timeout_ms = Keyword.get(opts, :cancel_timeout_ms, @dagster_cancel_timeout_ms)
+    os_pid = port_os_pid(port)
+
+    terminate_os_process(os_pid, :graceful)
+    wait_for_timed_out_port(port, command, os_pid, timeout_ms, logs_tail)
+  end
+
+  defp wait_for_timed_out_port(port, command, os_pid, timeout_ms, logs_tail) do
+    receive do
+      {^port, {:data, data}} ->
+        wait_for_timed_out_port(port, command, os_pid, timeout_ms, append_tail(logs_tail, data))
+
+      {^port, {:exit_status, exit_code}} ->
+        timed_out_result(exit_code, logs_tail)
+    after
+      timeout_ms ->
+        terminate_os_process(os_pid, :force)
+        timed_out_result(nil, logs_tail)
     end
   end
 
@@ -185,6 +224,41 @@ defmodule Dispatch.Worker.Executor do
       "logs_tail" => empty_to_nil(logs_tail)
     }
   end
+
+  defp timed_out_result(exit_code, logs_tail) do
+    %{
+      "status" => "failed",
+      "result" => nil,
+      "error" => "dagster_run exceeded execution timeout",
+      "exit_code" => exit_code,
+      "logs_tail" => empty_to_nil(logs_tail)
+    }
+  end
+
+  defp dagster_run_timeout_ms(params) do
+    value =
+      Map.get(params, "execution_timeout_seconds") ||
+        System.get_env(
+          "DISPATCH_DAGSTER_RUN_TIMEOUT_SECONDS",
+          Integer.to_string(@default_dagster_run_timeout_seconds)
+        )
+
+    case parse_positive_integer(value) do
+      {:ok, seconds} -> {:ok, seconds * 1_000}
+      :error -> {:error, "execution_timeout_seconds must be a positive integer"}
+    end
+  end
+
+  defp parse_positive_integer(value) when is_integer(value) and value > 0, do: {:ok, value}
+
+  defp parse_positive_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer > 0 -> {:ok, integer}
+      _ -> :error
+    end
+  end
+
+  defp parse_positive_integer(_value), do: :error
 
   defp append_tail(logs_tail, data) do
     combined = logs_tail <> data

@@ -88,6 +88,8 @@ defmodule Dispatch.Coordinator.JobStore do
     "running",
     "started_at",
     started_at,
+    "heartbeat_at",
+    started_at,
     "finished_at",
     "",
     "result",
@@ -373,6 +375,29 @@ defmodule Dispatch.Coordinator.JobStore do
 
   return "ok"
   """
+  @heartbeat_script """
+  local key = KEYS[1]
+  local status = redis.call("HGET", key, "status")
+
+  if not status then
+    return "not_found"
+  end
+
+  if status ~= "running" then
+    return "invalid_transition:" .. status
+  end
+
+  if redis.call("HGET", key, "started_at") ~= ARGV[1] then
+    return "stale_attempt"
+  end
+
+  if redis.call("HGET", key, "cancel_requested") == "1" then
+    return "stop_requested"
+  end
+
+  redis.call("HSET", key, "heartbeat_at", ARGV[2])
+  return "ok"
+  """
   @set_queue_diagnostic_script """
   local key = KEYS[1]
   local status = redis.call("HGET", key, "status")
@@ -414,6 +439,8 @@ defmodule Dispatch.Coordinator.JobStore do
       "inserted_at",
       now_iso8601(),
       "started_at",
+      "",
+      "heartbeat_at",
       "",
       "finished_at",
       "",
@@ -600,6 +627,17 @@ defmodule Dispatch.Coordinator.JobStore do
     end
   end
 
+  def heartbeat(job_id, started_at) do
+    case transition(@heartbeat_script, [job_key(job_id)], [started_at, now_iso8601()]) do
+      {:ok, "ok"} -> {:ok, :heartbeat}
+      {:ok, "stop_requested"} -> {:ok, :stop_requested}
+      {:ok, "not_found"} -> {:error, :not_found}
+      {:ok, "stale_attempt"} -> {:error, :stale_attempt}
+      {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   def cancel(job_id, reason \\ "canceled by request") do
     case transition(@cancel_script, [job_key(job_id), @queue_key], [
            job_id,
@@ -668,6 +706,7 @@ defmodule Dispatch.Coordinator.JobStore do
       resources: decode_json_field(fields["resources"]),
       worker_resources: decode_json_field(fields["worker_resources"]),
       started_at: normalize_field(fields["started_at"]),
+      heartbeat_at: normalize_field(fields["heartbeat_at"]),
       finished_at: normalize_field(fields["finished_at"]),
       dagster_run_id: normalize_field(fields["dagster_run_id"]),
       command: decode_json_field(fields["command"]),
@@ -688,6 +727,10 @@ defmodule Dispatch.Coordinator.JobStore do
 
   def processing_started_at(fields) do
     normalize_field(fields["started_at"])
+  end
+
+  def processing_heartbeat_at(fields) do
+    normalize_field(fields["heartbeat_at"]) || processing_started_at(fields)
   end
 
   defp fields_to_map(fields) do

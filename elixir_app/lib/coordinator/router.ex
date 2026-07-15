@@ -148,6 +148,29 @@ defmodule Dispatch.Coordinator.Router do
     end
   end
 
+  post "/internal/heartbeat" do
+    job_id = conn.body_params["job_id"]
+    started_at = conn.body_params["started_at"]
+
+    cond do
+      not is_binary(job_id) or job_id == "" ->
+        json(conn, 422, %{error: "job_id is required"})
+
+      not is_binary(started_at) or started_at == "" ->
+        json(conn, 422, %{error: "started_at is required"})
+
+      true ->
+        case JobStore.heartbeat(job_id, started_at) do
+          {:ok, :heartbeat} -> send_resp(conn, 204, "")
+          {:ok, :stop_requested} -> json(conn, 409, %{error: "stop requested"})
+          {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})
+          {:error, :invalid_transition} -> json(conn, 409, %{error: "invalid job state"})
+          {:error, :not_found} -> json(conn, 404, %{error: "job not found"})
+          {:error, reason} -> redis_error(conn, reason)
+        end
+    end
+  end
+
   post "/internal/rate_limit/acquire" do
     key = conn.body_params["rate_limit_key"]
     cost = Map.get(conn.body_params, "rate_limit_cost", 1)

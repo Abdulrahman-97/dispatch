@@ -14,6 +14,7 @@ defmodule ElixirAppTest do
         "error" => "",
         "inserted_at" => "2026-05-02T10:00:00Z",
         "started_at" => "2026-05-02T10:00:02Z",
+        "heartbeat_at" => "2026-05-02T10:00:06Z",
         "finished_at" => "2026-05-02T10:00:07Z",
         "worker_name" => "findash-stocks-worker-1",
         "worker_version" => "0.1.0",
@@ -50,6 +51,7 @@ defmodule ElixirAppTest do
     assert status.rate_limit_cost == 1
     assert status.rate_limits == %{"fmp_api" => 1}
     assert status.rate_limit_wait_ms == 1000
+    assert status.heartbeat_at == "2026-05-02T10:00:06Z"
     assert status.queue_wait_ms == 2_000
     assert status.worker_duration_ms == 5_000
     assert status.result_size_bytes == 2
@@ -318,6 +320,26 @@ defmodule ElixirAppTest do
     assert result["error"] == "dagster_run canceled"
   end
 
+  test "dagster_run execution timeout terminates command and returns failed status" do
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-1",
+            "command" => [python_executable(), "-c", "import time; time.sleep(5)"],
+            "env" => %{},
+            "execution_timeout_seconds" => 1
+          }
+        },
+        cancel_check_interval_ms: 10,
+        cancel_timeout_ms: 100
+      )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "dagster_run exceeded execution timeout"
+  end
+
   test "worker in draining mode does not poll for new jobs" do
     refute Dispatch.Worker.Scheduler.should_poll?(%{
              draining: true,
@@ -424,6 +446,20 @@ defmodule ElixirAppTest do
 
     assert Dispatch.Coordinator.Recovery.older_than_threshold?(started_at, now, 180)
     refute Dispatch.Coordinator.Recovery.older_than_threshold?(started_at, now, 1_800)
+  end
+
+  test "coordinator recovery uses the latest attempt heartbeat" do
+    fields = %{
+      "started_at" => "2026-05-02T10:00:00Z",
+      "heartbeat_at" => "2026-05-02T10:04:59Z"
+    }
+
+    assert Dispatch.Coordinator.JobStore.processing_heartbeat_at(fields) ==
+             "2026-05-02T10:04:59Z"
+
+    assert Dispatch.Coordinator.JobStore.processing_heartbeat_at(%{
+             "started_at" => "2026-05-02T10:00:00Z"
+           }) == "2026-05-02T10:00:00Z"
   end
 
   test "coordinator recovery threshold defaults to long-running job safe value" do

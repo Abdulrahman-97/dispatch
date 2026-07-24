@@ -7,6 +7,7 @@ defmodule Dispatch.Coordinator.Recovery do
 
   alias Dispatch.Coordinator.JobQueue
   alias Dispatch.Coordinator.JobStore
+  alias Dispatch.Observability
 
   @scan_interval_ms 30_000
   @default_stuck_after_seconds 1_800
@@ -46,21 +47,7 @@ defmodule Dispatch.Coordinator.Recovery do
          started_at when is_binary(started_at) <- JobStore.processing_started_at(job),
          heartbeat_at when is_binary(heartbeat_at) <- JobStore.processing_heartbeat_at(job),
          true <- older_than_threshold?(heartbeat_at, now, stuck_after_seconds()) do
-      case JobStore.requeue_stuck(job_id, started_at) do
-        {:ok, :requeued} ->
-          Logger.warning(
-            "recovery_requeued job=#{job_id} started_at=#{started_at} heartbeat_at=#{heartbeat_at}"
-          )
-
-        {:error, :stale_attempt} ->
-          :ok
-
-        {:error, :invalid_transition} ->
-          :ok
-
-        {:error, reason} ->
-          Logger.error("recovery_requeue_failed job=#{job_id} reason=#{inspect(reason)}")
-      end
+      recover_job(job_id, job, started_at, heartbeat_at)
     else
       {:error, :not_found} ->
         :ok
@@ -70,6 +57,64 @@ defmodule Dispatch.Coordinator.Recovery do
 
       _ ->
         :ok
+    end
+  end
+
+  def recovery_action(%{"job_type" => "dagster_run"}), do: :mark_worker_lost
+  def recovery_action(_job), do: :requeue
+
+  defp recover_job(job_id, job, started_at, heartbeat_at) do
+    result =
+      case recovery_action(job) do
+        :mark_worker_lost ->
+          JobStore.mark_worker_lost(job_id, started_at)
+
+        :requeue ->
+          JobStore.requeue_stuck(job_id, started_at)
+      end
+
+    case result do
+      {:ok, :worker_lost} ->
+        Observability.event(
+          "worker_lost",
+          %{
+            dispatch_job_id: job_id,
+            dagster_run_id: job["dagster_run_id"],
+            worker_name: job["worker_name"],
+            worker_instance_id: job["worker_instance_id"],
+            started_at: started_at,
+            heartbeat_at: heartbeat_at,
+            recovery_action: "reconciliation_required"
+          },
+          :warning
+        )
+
+      {:ok, :requeued} ->
+        Observability.event(
+          "worker_lost",
+          %{
+            dispatch_job_id: job_id,
+            worker_name: job["worker_name"],
+            worker_instance_id: job["worker_instance_id"],
+            started_at: started_at,
+            heartbeat_at: heartbeat_at,
+            recovery_action: "requeued"
+          },
+          :warning
+        )
+
+      {:error, :stale_attempt} ->
+        :ok
+
+      {:error, :invalid_transition} ->
+        :ok
+
+      {:error, reason} ->
+        Observability.event(
+          "worker_loss_recovery_failed",
+          %{dispatch_job_id: job_id, reason: inspect(reason)},
+          :error
+        )
     end
   end
 

@@ -7,6 +7,7 @@ defmodule Dispatch.Coordinator.Router do
   alias Dispatch.Coordinator.JobQueue
   alias Dispatch.Coordinator.RateLimiter
   alias Dispatch.Coordinator.JobStore
+  alias Dispatch.Observability
 
   plug(Plug.Logger)
 
@@ -32,10 +33,19 @@ defmodule Dispatch.Coordinator.Router do
 
       true ->
         case JobQueue.enqueue(job_type, params) do
-          {:ok, job_id} -> json(conn, 201, %{job_id: job_id})
-          {:ok, job_id, :existing} -> json(conn, 200, %{job_id: job_id, existing: true})
-          {:error, reason} when is_binary(reason) -> json(conn, 422, %{error: reason})
-          {:error, reason} -> redis_error(conn, reason)
+          {:ok, job_id} ->
+            log_submission(job_type, params, job_id, false)
+            json(conn, 201, %{job_id: job_id, existing: false})
+
+          {:ok, job_id, :existing} ->
+            log_submission(job_type, params, job_id, true)
+            json(conn, 200, %{job_id: job_id, existing: true})
+
+          {:error, reason} when is_binary(reason) ->
+            json(conn, 422, %{error: reason})
+
+          {:error, reason} ->
+            redis_error(conn, reason)
         end
     end
   end
@@ -43,12 +53,15 @@ defmodule Dispatch.Coordinator.Router do
   post "/jobs/:job_id/cancel" do
     case JobStore.cancel(job_id) do
       {:ok, :canceled} ->
+        log_cancellation(job_id, "applied")
         json(conn, 200, %{job_id: job_id, status: "canceled", cancellation: "applied"})
 
       {:ok, :cancel_requested} ->
+        log_cancellation(job_id, "requested")
         json(conn, 202, %{job_id: job_id, status: "running", cancellation: "requested"})
 
       {:ok, {:already_terminal, status}} ->
+        log_cancellation(job_id, "already_terminal")
         json(conn, 200, %{job_id: job_id, status: status, cancellation: "already_terminal"})
 
       {:error, :not_found} ->
@@ -85,6 +98,19 @@ defmodule Dispatch.Coordinator.Router do
     end
   end
 
+  get "/jobs/by-dagster-run/:dagster_run_id" do
+    case JobStore.get_by_dagster_run_id(dagster_run_id) do
+      {:ok, job_id, job} ->
+        json(conn, 200, JobStore.format_status(job_id, job))
+
+      {:error, :not_found} ->
+        json(conn, 404, %{error: "Dagster run has no Dispatch job"})
+
+      {:error, reason} ->
+        redis_error(conn, reason)
+    end
+  end
+
   get "/jobs/:job_id" do
     case JobStore.get(job_id) do
       {:ok, job} ->
@@ -111,7 +137,8 @@ defmodule Dispatch.Coordinator.Router do
              conn.body_params["worker_name"],
              available_resources,
              worker_resources,
-             conn.body_params["worker_version"]
+             conn.body_params["worker_version"],
+             conn.body_params["worker_instance_id"]
            ) do
         {:ok, job} ->
           json(conn, 200, job)
@@ -140,6 +167,7 @@ defmodule Dispatch.Coordinator.Router do
       true ->
         case JobStore.interrupt(job_id, started_at, reason) do
           {:ok, :interrupted} -> send_resp(conn, 204, "")
+          {:ok, :worker_lost} -> send_resp(conn, 204, "")
           {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})
           {:error, :invalid_transition} -> json(conn, 409, %{error: "invalid job state"})
           {:error, :not_found} -> json(conn, 404, %{error: "job not found"})
@@ -225,12 +253,29 @@ defmodule Dispatch.Coordinator.Router do
                    "rate_limit_wait_ms" => conn.body_params["rate_limit_wait_ms"],
                    "exit_code" => conn.body_params["exit_code"],
                    "logs_tail" => conn.body_params["logs_tail"],
-                   "worker_version" => conn.body_params["worker_version"]
+                   "worker_version" => conn.body_params["worker_version"],
+                   "failure_category" => conn.body_params["failure_category"]
                  }) do
-              {:ok, _} -> send_resp(conn, 204, "")
-              {:error, :stale_attempt} -> json(conn, 409, %{error: "stale job attempt"})
-              {:error, :invalid_transition} -> json(conn, 409, %{error: "invalid job state"})
-              {:error, reason} -> redis_error(conn, reason)
+              {:ok, _} ->
+                Observability.event("result_reported", %{
+                  dispatch_job_id: job_id,
+                  dagster_run_id: job_dagster_run_id(job_id),
+                  worker_name: worker_name,
+                  worker_instance_id: conn.body_params["worker_instance_id"],
+                  status: status,
+                  failure_category: conn.body_params["failure_category"]
+                })
+
+                send_resp(conn, 204, "")
+
+              {:error, :stale_attempt} ->
+                json(conn, 409, %{error: "stale job attempt"})
+
+              {:error, :invalid_transition} ->
+                json(conn, 409, %{error: "invalid job state"})
+
+              {:error, reason} ->
+                redis_error(conn, reason)
             end
 
           {:error, :not_found} ->
@@ -253,10 +298,53 @@ defmodule Dispatch.Coordinator.Router do
   end
 
   defp redis_error(conn, reason) do
-    json(conn, 500, %{error: "redis error", detail: inspect(reason)})
+    json(conn, 500, %{
+      error: "redis error",
+      detail: Observability.sanitize_error(inspect(reason))
+    })
   end
 
   defp valid_job_type?(job_type) do
     is_binary(job_type) and String.match?(job_type, ~r/^[a-z0-9_]+$/)
+  end
+
+  defp log_submission(job_type, params, job_id, existing) do
+    metadata = Map.get(params, "metadata", %{})
+
+    Observability.event("submission_accepted", %{
+      dispatch_job_id: job_id,
+      dagster_run_id: params["dagster_run_id"],
+      job_type: job_type,
+      dagster_job_name: metadata["dagster_job_name"],
+      dagster_code_location: metadata["dagster_code_location"],
+      deployment_revision: metadata["deployment_revision"],
+      existing: existing
+    })
+  end
+
+  defp log_cancellation(job_id, outcome) do
+    attrs =
+      case JobStore.get(job_id) do
+        {:ok, job} ->
+          %{
+            dispatch_job_id: job_id,
+            dagster_run_id: job["dagster_run_id"],
+            worker_name: job["worker_name"],
+            worker_instance_id: job["worker_instance_id"],
+            cancellation: outcome
+          }
+
+        _ ->
+          %{dispatch_job_id: job_id, cancellation: outcome}
+      end
+
+    Observability.event("cancellation_requested", attrs)
+  end
+
+  defp job_dagster_run_id(job_id) do
+    case JobStore.get(job_id) do
+      {:ok, job} -> job["dagster_run_id"]
+      _ -> nil
+    end
   end
 end

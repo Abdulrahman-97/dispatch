@@ -51,7 +51,8 @@ defmodule Dispatch.Coordinator.JobQueue do
         worker_name \\ nil,
         available_resources \\ %{"default_slots" => 1},
         worker_resources \\ nil,
-        worker_version \\ nil
+        worker_version \\ nil,
+        worker_instance_id \\ nil
       ) do
     worker_resources = worker_resources || available_resources
 
@@ -68,7 +69,8 @@ defmodule Dispatch.Coordinator.JobQueue do
             worker_name,
             normalized_available,
             normalized_worker_resources,
-            worker_version
+            worker_version,
+            worker_instance_id
           )
 
         {:error, reason} ->
@@ -90,7 +92,8 @@ defmodule Dispatch.Coordinator.JobQueue do
          worker_name,
          available_resources,
          worker_resources,
-         worker_version
+         worker_version,
+         worker_instance_id
        ) do
     job_ids
     |> Enum.reverse()
@@ -100,7 +103,8 @@ defmodule Dispatch.Coordinator.JobQueue do
              worker_name,
              available_resources,
              worker_resources,
-             worker_version
+             worker_version,
+             worker_instance_id
            ) do
         :skip -> {:cont, :empty}
         :empty -> {:cont, :empty}
@@ -112,7 +116,14 @@ defmodule Dispatch.Coordinator.JobQueue do
     end)
   end
 
-  defp maybe_claim_job(job_id, worker_name, available_resources, worker_resources, worker_version) do
+  defp maybe_claim_job(
+         job_id,
+         worker_name,
+         available_resources,
+         worker_resources,
+         worker_version,
+         worker_instance_id
+       ) do
     with {:ok, payload} <- JobStore.payload(job_id),
          params when is_map(params) <- Map.get(payload, "params", %{}),
          {:ok, requirements} <- Resources.requirements_from_params(params),
@@ -127,7 +138,8 @@ defmodule Dispatch.Coordinator.JobQueue do
              worker_name,
              worker_resources,
              rate_entries,
-             worker_version
+             worker_version,
+             worker_instance_id
            ) do
         {:ok, :running} ->
           claimed_job(job_id, started_at, worker_name, requirements)
@@ -183,6 +195,7 @@ defmodule Dispatch.Coordinator.JobQueue do
 
   defp claimed_job(job_id, started_at, worker_name, requirements) do
     with {:ok, payload} <- JobStore.payload(job_id),
+         {:ok, fields} <- JobStore.get(job_id),
          job_type when is_binary(job_type) <- Map.get(payload, "job_type"),
          params when is_map(params) <- Map.get(payload, "params", %{}) do
       {:ok,
@@ -192,6 +205,7 @@ defmodule Dispatch.Coordinator.JobQueue do
          params: params,
          started_at: started_at,
          worker_name: worker_name,
+         attempt: parse_attempt(fields["attempt"]),
          resources: requirements
        }}
     else
@@ -237,4 +251,13 @@ defmodule Dispatch.Coordinator.JobQueue do
     |> DateTime.truncate(:second)
     |> DateTime.to_iso8601()
   end
+
+  defp parse_attempt(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {attempt, ""} -> attempt
+      _ -> nil
+    end
+  end
+
+  defp parse_attempt(_value), do: nil
 end

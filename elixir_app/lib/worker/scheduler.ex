@@ -6,6 +6,7 @@ defmodule Dispatch.Worker.Scheduler do
   require Logger
 
   alias Dispatch.Resources
+  alias Dispatch.Observability
   alias Dispatch.Worker.Executor
 
   @http_options [timeout: 5_000]
@@ -32,11 +33,18 @@ defmodule Dispatch.Worker.Scheduler do
       coordinator_url: coordinator_url(),
       worker_name: worker_name(),
       worker_version: worker_version(),
+      worker_instance_id: worker_instance_id(),
       running: %{},
       draining: false
     }
 
-    Logger.info("worker=#{state.worker_name} resources=#{inspect(capacity)}")
+    Observability.event("worker_started", %{
+      worker_name: state.worker_name,
+      worker_instance_id: state.worker_instance_id,
+      worker_version: state.worker_version,
+      resources: capacity
+    })
+
     send(self(), :poll)
     {:ok, state}
   end
@@ -73,43 +81,54 @@ defmodule Dispatch.Worker.Scheduler do
       |> Map.put("started_at", job["started_at"])
       |> Map.put("worker_name", state.worker_name)
       |> Map.put("worker_version", state.worker_version)
+      |> Map.put("worker_instance_id", state.worker_instance_id)
 
-    case post_json(state.coordinator_url, "/internal/result", payload) do
-      {:ok, 204, _body} ->
-        Logger.info("worker=#{state.worker_name} job=#{job["job_id"]} status=#{result["status"]}")
+    Observability.event(
+      "process_exited",
+      correlation(job, state)
+      |> Map.merge(%{
+        status: result["status"],
+        exit_code: result["exit_code"],
+        failure_category: result["failure_category"]
+      })
+    )
 
-      {:ok, 409, body} ->
-        Logger.warning(
-          "worker=#{state.worker_name} job=#{job["job_id"]} stale_result body=#{inspect(body)}"
-        )
-
-      {:ok, status, body} ->
-        Logger.error(
-          "worker=#{state.worker_name} job=#{job["job_id"]} result_submit_failed status=#{status} body=#{inspect(body)}"
-        )
-
-      {:error, reason} ->
-        Logger.error(
-          "worker=#{state.worker_name} job=#{job["job_id"]} result_submit_failed reason=#{inspect(reason)}"
-        )
-    end
+    maybe_log_upload_completed(job, state, result)
+    report_result(state, job, payload)
 
     send(self(), :poll)
     {:noreply, state}
   end
 
   def handle_info({:signal, :sigterm}, state) do
-    Logger.warning("worker=#{state.worker_name} draining reason=sigterm")
+    Observability.event(
+      "worker_shutdown_started",
+      %{
+        worker_name: state.worker_name,
+        worker_instance_id: state.worker_instance_id,
+        active_job_ids: Map.keys(state.running),
+        reason: "sigterm"
+      },
+      :warning
+    )
+
     {:noreply, %{state | draining: true}}
   end
 
   @impl true
   def terminate(reason, state) do
     Enum.each(state.running, fn {_job_id, job} ->
+      Observability.event(
+        "worker_shutdown_during_execution",
+        Map.put(correlation(job, state), :reason, inspect(reason)),
+        :warning
+      )
+
       payload = %{
         "job_id" => job["job_id"],
         "started_at" => job["started_at"],
         "worker_name" => state.worker_name,
+        "worker_instance_id" => state.worker_instance_id,
         "reason" => "worker interrupted: #{inspect(reason)}"
       }
 
@@ -123,6 +142,7 @@ defmodule Dispatch.Worker.Scheduler do
     payload = %{
       "worker_name" => state.worker_name,
       "worker_version" => state.worker_version,
+      "worker_instance_id" => state.worker_instance_id,
       "draining" => state.draining,
       "resource_capacity" => state.capacity,
       "available_resources" => state.available
@@ -134,10 +154,11 @@ defmodule Dispatch.Worker.Scheduler do
              {:ok, requirements} <-
                Resources.requirements_from_params(Map.get(job, "params", %{})),
              true <- Resources.fits?(requirements, state.available) do
-          Logger.info("worker=#{state.worker_name} job=#{job["job_id"]} picked up")
+          Observability.event("worker_assigned", correlation(job, state))
           parent = self()
 
           Task.start(fn ->
+            Observability.event("process_started", correlation(job, state))
             send(parent, {:job_finished, job, requirements, safe_execute(job, state)})
           end)
 
@@ -177,42 +198,181 @@ defmodule Dispatch.Worker.Scheduler do
   end
 
   defp safe_execute(job, state) do
-    try do
-      Executor.run(job,
-        cancel_check: fn ->
-          attempt_should_stop?(
-            state.coordinator_url,
-            job["job_id"],
-            job["started_at"]
-          )
-        end
-      )
-    rescue
-      exception ->
-        %{
-          "status" => "failed",
-          "result" => nil,
-          "error" => "executor crashed: #{Exception.message(exception)}"
-        }
-    catch
-      kind, reason ->
-        %{
-          "status" => "failed",
-          "result" => nil,
-          "error" => "executor crashed: #{kind}: #{inspect(reason)}"
-        }
+    result =
+      try do
+        Executor.run(job,
+          cancel_check: fn ->
+            attempt_should_stop?(state, job)
+          end
+        )
+      rescue
+        exception ->
+          %{
+            "status" => "failed",
+            "result" => nil,
+            "error" => "executor crashed: #{Exception.message(exception)}",
+            "failure_category" => "executor_crash"
+          }
+      catch
+        kind, reason ->
+          %{
+            "status" => "failed",
+            "result" => nil,
+            "error" => "executor crashed: #{kind}: #{inspect(reason)}",
+            "failure_category" => "executor_crash"
+          }
+      end
+
+    sanitize_result(result)
+  end
+
+  defp attempt_should_stop?(state, job) do
+    case post_json(state.coordinator_url, "/internal/heartbeat", %{
+           "job_id" => job["job_id"],
+           "started_at" => job["started_at"],
+           "worker_name" => state.worker_name,
+           "worker_instance_id" => state.worker_instance_id
+         }) do
+      {:ok, 204, _body} ->
+        maybe_log_heartbeat(job, state)
+        false
+
+      {:ok, 409, body} ->
+        Observability.event(
+          "cancellation_acknowledged",
+          Map.put(correlation(job, state), :coordinator_response, body)
+        )
+
+        true
+
+      {:ok, status, body} ->
+        Observability.event(
+          "heartbeat_failed",
+          correlation(job, state)
+          |> Map.merge(%{http_status: status, coordinator_response: body}),
+          :warning
+        )
+
+        false
+
+      {:error, reason} ->
+        Observability.event(
+          "heartbeat_failed",
+          Map.put(correlation(job, state), :reason, inspect(reason)),
+          :warning
+        )
+
+        false
     end
   end
 
-  defp attempt_should_stop?(coordinator_url, job_id, started_at) do
-    case post_json(coordinator_url, "/internal/heartbeat", %{
-           "job_id" => job_id,
-           "started_at" => started_at
-         }) do
-      {:ok, 204, _body} -> false
-      {:ok, 409, _body} -> true
-      _ -> false
+  defp report_result(state, job, payload, attempt \\ 1) do
+    case post_json(state.coordinator_url, "/internal/result", payload) do
+      {:ok, 204, _body} ->
+        Observability.event(
+          "result_reported",
+          correlation(job, state)
+          |> Map.merge(%{
+            status: payload["status"],
+            failure_category: payload["failure_category"],
+            report_attempt: attempt
+          })
+        )
+
+        :ok
+
+      {:ok, 409, body} ->
+        Observability.event(
+          "result_report_rejected",
+          correlation(job, state)
+          |> Map.merge(%{report_attempt: attempt, coordinator_response: body}),
+          :warning
+        )
+
+        :stale
+
+      response ->
+        if attempt < result_report_max_attempts() do
+          Observability.event(
+            "result_reporting_retry",
+            correlation(job, state)
+            |> Map.merge(%{report_attempt: attempt, reason: inspect(response)}),
+            :warning
+          )
+
+          Process.sleep(result_report_retry_delay_ms(attempt))
+          report_result(state, job, payload, attempt + 1)
+        else
+          Observability.event(
+            "result_reporting_failed",
+            correlation(job, state)
+            |> Map.merge(%{
+              report_attempt: attempt,
+              reason: inspect(response),
+              final_status: payload["status"]
+            }),
+            :error
+          )
+
+          :error
+        end
     end
+  end
+
+  defp sanitize_result(result) do
+    result
+    |> Map.update("error", nil, &Observability.sanitize_error/1)
+    |> Map.update("logs_tail", nil, &Observability.sanitize_logs_tail/1)
+  end
+
+  defp maybe_log_heartbeat(job, state) do
+    key = {:dispatch_heartbeat_log, job["job_id"]}
+    now_ms = System.monotonic_time(:millisecond)
+    last_logged_ms = Process.get(key)
+
+    if is_nil(last_logged_ms) or now_ms - last_logged_ms >= heartbeat_log_interval_ms() do
+      Process.put(key, now_ms)
+      Observability.event("heartbeat", correlation(job, state))
+    end
+  end
+
+  defp maybe_log_upload_completed(job, state, %{"status" => "success"}) do
+    log_location =
+      job
+      |> Map.get("params", %{})
+      |> Map.get("metadata", %{})
+      |> Map.get("log_location")
+
+    if is_binary(log_location) and log_location != "" do
+      Observability.event(
+        "log_upload_completed",
+        correlation(job, state)
+        |> Map.merge(%{
+          log_location: log_location,
+          verification: "dagster_process_completed_without_launcher_error"
+        })
+      )
+    end
+  end
+
+  defp maybe_log_upload_completed(_job, _state, _result), do: :ok
+
+  defp correlation(job, state) do
+    params = Map.get(job, "params", %{})
+    metadata = Map.get(params, "metadata", %{})
+
+    %{
+      dispatch_job_id: job["job_id"],
+      dagster_run_id: params["dagster_run_id"],
+      dagster_job_name: metadata["dagster_job_name"],
+      dagster_code_location: metadata["dagster_code_location"],
+      deployment_revision: metadata["deployment_revision"],
+      attempt: job["attempt"],
+      attempt_started_at: job["started_at"],
+      worker_name: state.worker_name,
+      worker_instance_id: state.worker_instance_id,
+      worker_version: state.worker_version
+    }
   end
 
   defp post_json(base_url, path, payload) do
@@ -252,6 +412,26 @@ defmodule Dispatch.Worker.Scheduler do
     |> String.to_integer()
   end
 
+  defp heartbeat_log_interval_ms do
+    System.get_env("DISPATCH_HEARTBEAT_LOG_INTERVAL_MS", "60000")
+    |> String.to_integer()
+  end
+
+  defp result_report_max_attempts do
+    System.get_env("DISPATCH_RESULT_REPORT_MAX_ATTEMPTS", "5")
+    |> String.to_integer()
+    |> max(1)
+  end
+
+  defp result_report_retry_delay_ms(attempt) do
+    base_delay =
+      System.get_env("DISPATCH_RESULT_REPORT_RETRY_BASE_MS", "250")
+      |> String.to_integer()
+      |> max(1)
+
+    min(base_delay * Integer.pow(2, attempt - 1), 5_000)
+  end
+
   defp worker_concurrency do
     System.get_env("WORKER_CONCURRENCY", "5")
     |> String.to_integer()
@@ -259,6 +439,12 @@ defmodule Dispatch.Worker.Scheduler do
 
   defp worker_name do
     System.get_env("WORKER_NAME") || "worker-1"
+  end
+
+  defp worker_instance_id do
+    System.get_env("DISPATCH_WORKER_INSTANCE_ID") ||
+      System.get_env("HOSTNAME") ||
+      "worker-instance-#{System.unique_integer([:positive])}"
   end
 
   defp worker_version do

@@ -1,6 +1,8 @@
 defmodule ElixirAppTest do
   use ExUnit.Case
 
+  import ExUnit.CaptureLog
+
   test "basic truth" do
     assert true
   end
@@ -17,15 +19,28 @@ defmodule ElixirAppTest do
         "heartbeat_at" => "2026-05-02T10:00:06Z",
         "finished_at" => "2026-05-02T10:00:07Z",
         "worker_name" => "findash-stocks-worker-1",
+        "worker_instance_id" => "container-abc",
         "worker_version" => "0.1.0",
+        "attempt" => "2",
+        "recovery_count" => "1",
+        "last_worker_name" => "findash-stocks-worker-old",
+        "last_worker_instance_id" => "container-old",
+        "last_worker_lost_at" => "2026-05-02T09:59:00Z",
         "group_id" => "group-1",
         "dagster_run_id" => "dagster-run-1",
+        "dagster_job_name" => "daily_prices",
+        "dagster_code_location" => "stocks",
         "command" => ~s(["dagster","api","execute_run"]),
         "image" => "stocks-worker:test",
+        "deployment_revision" => "abc123",
         "metadata" => ~s({"dagster_job_name":"daily_prices"}),
+        "log_location" => "s3://logs/dagster/storage/dagster-run-1/compute_logs",
         "exit_code" => "0",
         "logs_tail" => "run finished",
+        "failure_category" => "",
         "cancel_requested" => "0",
+        "cancel_requested_at" => "",
+        "cancellation_acknowledged_at" => "",
         "resources" => ~s({"api_slots":1,"memory_slots":1}),
         "worker_resources" => ~s({"api_slots":50,"memory_slots":8}),
         "rate_limit_key" => "fmp_api",
@@ -35,15 +50,25 @@ defmodule ElixirAppTest do
       })
 
     assert status.worker_name == "findash-stocks-worker-1"
+    assert status.worker_instance_id == "container-abc"
     assert status.worker_version == "0.1.0"
+    assert status.attempt == 2
+    assert status.recovery_count == 1
+    assert status.last_worker_name == "findash-stocks-worker-old"
+    assert status.last_worker_instance_id == "container-old"
+    assert status.last_worker_lost_at == "2026-05-02T09:59:00Z"
     assert status.job_type == "dagster_run"
     assert status.resources == %{"api_slots" => 1, "memory_slots" => 1}
     assert status.worker_resources == %{"api_slots" => 50, "memory_slots" => 8}
     assert status.group_id == "group-1"
     assert status.dagster_run_id == "dagster-run-1"
+    assert status.dagster_job_name == "daily_prices"
+    assert status.dagster_code_location == "stocks"
     assert status.command == ["dagster", "api", "execute_run"]
     assert status.image == "stocks-worker:test"
+    assert status.deployment_revision == "abc123"
     assert status.metadata == %{"dagster_job_name" => "daily_prices"}
+    assert status.log_location == "s3://logs/dagster/storage/dagster-run-1/compute_logs"
     assert status.exit_code == 0
     assert status.logs_tail == "run finished"
     refute status.cancel_requested
@@ -284,6 +309,26 @@ defmodule ElixirAppTest do
     end
   end
 
+  test "idempotency lookup finds an existing job by Dagster run id" do
+    {:ok, agent} = Agent.start_link(fn -> %{} end)
+
+    try do
+      command = idempotency_command(agent)
+
+      assert Dispatch.Coordinator.Idempotency.reserve("dagster_run", "run-1", "job-1",
+               command: command
+             ) == {:ok, :reserved}
+
+      assert Dispatch.Coordinator.Idempotency.lookup("dagster_run", "run-1", command: command) ==
+               {:ok, "job-1"}
+
+      assert Dispatch.Coordinator.Idempotency.lookup("dagster_run", "missing", command: command) ==
+               {:error, :not_found}
+    after
+      Agent.stop(agent)
+    end
+  end
+
   test "dagster_run command success captures exit code and logs tail" do
     result =
       Dispatch.Worker.Executor.run(%{
@@ -298,6 +343,7 @@ defmodule ElixirAppTest do
     assert result["status"] == "success"
     assert result["exit_code"] == 0
     assert result["logs_tail"] == "dagster-ok"
+    assert result["failure_category"] == nil
   end
 
   test "running dagster_run cancellation terminates command and returns canceled status" do
@@ -318,6 +364,7 @@ defmodule ElixirAppTest do
 
     assert result["status"] == "canceled"
     assert result["error"] == "dagster_run canceled"
+    assert result["failure_category"] == "canceled"
   end
 
   test "dagster_run execution timeout terminates command and returns failed status" do
@@ -338,6 +385,106 @@ defmodule ElixirAppTest do
 
     assert result["status"] == "failed"
     assert result["error"] == "dagster_run exceeded execution timeout"
+    assert result["failure_category"] == "timeout"
+  end
+
+  test "dagster_run force kills a process that ignores graceful termination" do
+    command =
+      if match?({:win32, _name}, :os.type()) do
+        "import time; time.sleep(5)"
+      else
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(5)"
+      end
+
+    started_at = System.monotonic_time(:millisecond)
+
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-force-kill",
+            "command" => [python_executable(), "-c", command],
+            "env" => %{}
+          }
+        },
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 25,
+        cancel_timeout_ms: 100
+      )
+
+    duration_ms = System.monotonic_time(:millisecond) - started_at
+    assert result["status"] == "canceled"
+    assert result["failure_category"] == "canceled"
+    assert duration_ms < 2_000
+  end
+
+  test "dagster_run cancellation is not starved by continuous output" do
+    started_at = System.monotonic_time(:millisecond)
+
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-continuous-output",
+            "command" => [
+              python_executable(),
+              "-c",
+              "import sys,time\nwhile True:\n print('x' * 4096, flush=True)\n time.sleep(0.001)"
+            ],
+            "env" => %{}
+          }
+        },
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 25,
+        cancel_timeout_ms: 100
+      )
+
+    duration_ms = System.monotonic_time(:millisecond) - started_at
+    assert result["status"] == "canceled"
+    assert result["failure_category"] == "canceled"
+    assert duration_ms < 2_000
+  end
+
+  test "dagster_run logs tail redacts secrets and remains bounded" do
+    secret = "super-secret-value"
+    noisy = String.duplicate("x", 20_000)
+
+    result =
+      Dispatch.Worker.Executor.run(%{
+        "job_type" => "dagster_run",
+        "params" => %{
+          "dagster_run_id" => "run-1",
+          "command" => [
+            python_executable(),
+            "-c",
+            ~s/print("#{noisy} API_KEY=#{secret}", end="")/
+          ],
+          "env" => %{}
+        }
+      })
+
+    refute result["logs_tail"] =~ secret
+    assert result["logs_tail"] =~ "API_KEY=[REDACTED]"
+    assert String.length(result["logs_tail"]) <= 16_400
+  end
+
+  test "structured observability logs redact sensitive values and bound error text" do
+    log =
+      capture_log(fn ->
+        Dispatch.Observability.event("probe", %{
+          dagster_run_id: "run-1",
+          error: "token=abc123 " <> String.duplicate("x", 5_000),
+          password: "do-not-log"
+        })
+      end)
+
+    refute log =~ "abc123"
+    refute log =~ "do-not-log"
+    assert log =~ "token=[REDACTED]"
+    assert log =~ ~s("password":"[REDACTED]")
+    assert String.length(log) < 5_000
   end
 
   test "worker in draining mode does not poll for new jobs" do
@@ -460,6 +607,41 @@ defmodule ElixirAppTest do
     assert Dispatch.Coordinator.JobStore.processing_heartbeat_at(%{
              "started_at" => "2026-05-02T10:00:00Z"
            }) == "2026-05-02T10:00:00Z"
+  end
+
+  test "lost Dagster runs require reconciliation instead of automatic requeue" do
+    assert Dispatch.Coordinator.Recovery.recovery_action(%{
+             "job_type" => "dagster_run"
+           }) == :mark_worker_lost
+
+    assert Dispatch.Coordinator.Recovery.recovery_action(%{
+             "job_type" => "python_callable"
+           }) == :requeue
+  end
+
+  test "worker loss before process start uses the claim heartbeat and requires reconciliation" do
+    fields = %{"started_at" => "2026-05-02T10:00:00Z", "job_type" => "dagster_run"}
+    now = ~U[2026-05-02 10:31:00Z]
+
+    heartbeat_at = Dispatch.Coordinator.JobStore.processing_heartbeat_at(fields)
+
+    assert heartbeat_at == "2026-05-02T10:00:00Z"
+    assert Dispatch.Coordinator.Recovery.older_than_threshold?(heartbeat_at, now, 1_800)
+    assert Dispatch.Coordinator.Recovery.recovery_action(fields) == :mark_worker_lost
+  end
+
+  test "worker loss during execution uses the latest stale heartbeat and requires reconciliation" do
+    fields = %{
+      "started_at" => "2026-05-02T10:00:00Z",
+      "heartbeat_at" => "2026-05-02T10:10:00Z",
+      "job_type" => "dagster_run"
+    }
+
+    now = ~U[2026-05-02 10:41:00Z]
+    heartbeat_at = Dispatch.Coordinator.JobStore.processing_heartbeat_at(fields)
+
+    assert Dispatch.Coordinator.Recovery.older_than_threshold?(heartbeat_at, now, 1_800)
+    assert Dispatch.Coordinator.Recovery.recovery_action(fields) == :mark_worker_lost
   end
 
   test "coordinator recovery threshold defaults to long-running job safe value" do

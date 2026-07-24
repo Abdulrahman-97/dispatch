@@ -1,6 +1,9 @@
 defmodule Dispatch.Coordinator.JobStore do
   @moduledoc false
 
+  alias Dispatch.Coordinator.Idempotency
+  alias Dispatch.Observability
+
   @processing_key "jobs:processing"
   @queue_key "jobs:queue"
   @group_prefix "job_group:"
@@ -102,11 +105,18 @@ defmodule Dispatch.Coordinator.JobStore do
     worker_resources,
     "worker_version",
     ARGV[arg_index],
+    "worker_instance_id",
+    ARGV[arg_index + 1],
     "group_id",
     group_id or "",
+    "failure_category",
+    "",
+    "cancellation_acknowledged_at",
+    "",
     "queued_reason",
     ""
   )
+  redis.call("HINCRBY", job_key, "attempt", "1")
 
   return {"ok"}
   """
@@ -150,7 +160,7 @@ defmodule Dispatch.Coordinator.JobStore do
     return "not_found"
   end
 
-  if status ~= "running" then
+  if status ~= "running" and status ~= "worker_lost" then
     return "invalid_transition:" .. status
   end
 
@@ -191,6 +201,14 @@ defmodule Dispatch.Coordinator.JobStore do
     redis.call("HSET", key, "worker_version", ARGV[11])
   end
 
+  if ARGV[12] ~= "" then
+    redis.call("HSET", key, "failure_category", ARGV[12])
+  end
+
+  if ARGV[13] ~= "" then
+    redis.call("HSET", key, "cancellation_acknowledged_at", ARGV[13])
+  end
+
   redis.call("LREM", processing_key, "1", ARGV[1])
 
   return "ok"
@@ -215,10 +233,14 @@ defmodule Dispatch.Coordinator.JobStore do
       "1",
       "cancel_requested_at",
       ARGV[2],
+      "cancellation_acknowledged_at",
+      ARGV[2],
       "finished_at",
       ARGV[2],
       "error",
       ARGV[3],
+      "failure_category",
+      "canceled",
       "queued_reason",
       "canceled"
     )
@@ -272,11 +294,41 @@ defmodule Dispatch.Coordinator.JobStore do
       ARGV[3],
       "error",
       "canceled before stuck-job recovery",
+      "failure_category",
+      "canceled",
+      "cancellation_acknowledged_at",
+      ARGV[3],
       "queued_reason",
       "canceled"
     )
 
     return "ok"
+  end
+
+  if redis.call("HGET", key, "job_type") == "dagster_run" then
+    redis.call("LREM", processing_key, "1", ARGV[1])
+    redis.call(
+      "HSET",
+      key,
+      "status",
+      "worker_lost",
+      "finished_at",
+      ARGV[3],
+      "error",
+      ARGV[4],
+      "failure_category",
+      "worker_lost",
+      "last_worker_name",
+      redis.call("HGET", key, "worker_name") or "",
+      "last_worker_instance_id",
+      redis.call("HGET", key, "worker_instance_id") or "",
+      "last_worker_lost_at",
+      ARGV[3],
+      "queued_reason",
+      "reconciliation_required"
+    )
+
+    return "worker_lost"
   end
 
   redis.call("LREM", processing_key, "1", ARGV[1])
@@ -293,8 +345,10 @@ defmodule Dispatch.Coordinator.JobStore do
     "result",
     "",
     "error",
-    ARGV[3],
+    ARGV[4],
     "worker_name",
+    "",
+    "worker_instance_id",
     "",
     "worker_resources",
     "",
@@ -302,6 +356,8 @@ defmodule Dispatch.Coordinator.JobStore do
     "",
     "cancel_requested",
     "0",
+    "failure_category",
+    "worker_interrupted",
     "queued_reason",
     "worker_interrupted"
   )
@@ -346,6 +402,8 @@ defmodule Dispatch.Coordinator.JobStore do
 
   redis.call("LREM", processing_key, "1", ARGV[1])
   redis.call("LPUSH", queue_key, ARGV[1])
+  local previous_worker_name = redis.call("HGET", key, "worker_name") or ""
+  local previous_worker_instance_id = redis.call("HGET", key, "worker_instance_id") or ""
   redis.call(
     "HSET",
     key,
@@ -361,6 +419,8 @@ defmodule Dispatch.Coordinator.JobStore do
     "",
     "worker_name",
     "",
+    "worker_instance_id",
+    "",
     "worker_resources",
     "",
     "worker_version",
@@ -369,8 +429,58 @@ defmodule Dispatch.Coordinator.JobStore do
     "0",
     "cancel_requested",
     "0",
+    "last_worker_name",
+    previous_worker_name,
+    "last_worker_instance_id",
+    previous_worker_instance_id,
+    "last_worker_lost_at",
+    ARGV[3],
+    "failure_category",
+    "worker_lost",
     "queued_reason",
     "recovered_stuck_job"
+  )
+  redis.call("HINCRBY", key, "recovery_count", "1")
+
+  return "ok"
+  """
+  @mark_worker_lost_script """
+  local key = KEYS[1]
+  local processing_key = KEYS[2]
+  local status = redis.call("HGET", key, "status")
+
+  if not status then
+    return "not_found"
+  end
+
+  if status ~= "running" then
+    return "invalid_transition:" .. status
+  end
+
+  if redis.call("HGET", key, "started_at") ~= ARGV[2] then
+    return "stale_attempt"
+  end
+
+  redis.call("LREM", processing_key, "1", ARGV[1])
+  redis.call(
+    "HSET",
+    key,
+    "status",
+    "worker_lost",
+    "finished_at",
+    ARGV[3],
+    "error",
+    ARGV[4],
+    "failure_category",
+    "worker_lost",
+    "last_worker_name",
+    redis.call("HGET", key, "worker_name") or "",
+    "last_worker_instance_id",
+    redis.call("HGET", key, "worker_instance_id") or "",
+    "last_worker_lost_at",
+    ARGV[3],
+    "queued_reason",
+    "reconciliation_required"
   )
 
   return "ok"
@@ -446,6 +556,8 @@ defmodule Dispatch.Coordinator.JobStore do
       "",
       "worker_name",
       "",
+      "worker_instance_id",
+      "",
       "rate_limit_key",
       attrs["rate_limit_key"] || "",
       "rate_limit_cost",
@@ -460,9 +572,21 @@ defmodule Dispatch.Coordinator.JobStore do
       "",
       "worker_version",
       attrs["worker_version"] || "",
+      "attempt",
+      "0",
+      "recovery_count",
+      "0",
+      "last_worker_name",
+      "",
+      "last_worker_instance_id",
+      "",
+      "last_worker_lost_at",
+      "",
       "exit_code",
       "",
       "logs_tail",
+      "",
+      "failure_category",
       "",
       "dagster_run_id",
       attrs["dagster_run_id"] || "",
@@ -474,9 +598,19 @@ defmodule Dispatch.Coordinator.JobStore do
       attrs["image"] || "",
       "metadata",
       attrs["metadata"] || "",
+      "dagster_job_name",
+      attrs["dagster_job_name"] || "",
+      "dagster_code_location",
+      attrs["dagster_code_location"] || "",
+      "deployment_revision",
+      attrs["deployment_revision"] || "",
+      "log_location",
+      attrs["log_location"] || "",
       "cancel_requested",
       "0",
       "cancel_requested_at",
+      "",
+      "cancellation_acknowledged_at",
       "",
       "group_id",
       attrs["group_id"] || "",
@@ -524,6 +658,13 @@ defmodule Dispatch.Coordinator.JobStore do
     end
   end
 
+  def get_by_dagster_run_id(dagster_run_id) do
+    with {:ok, job_id} <- Idempotency.lookup("dagster_run", dagster_run_id),
+         {:ok, job} <- get(job_id) do
+      {:ok, job_id, job}
+    end
+  end
+
   def payload(job_id) do
     with {:ok, job} <- get(job_id),
          payload when is_binary(payload) <- Map.get(job, "payload"),
@@ -553,7 +694,8 @@ defmodule Dispatch.Coordinator.JobStore do
         worker_name,
         worker_resources,
         rate_limit_entries,
-        worker_version \\ nil
+        worker_version \\ nil,
+        worker_instance_id \\ nil
       ) do
     keys =
       [job_key(job_id), @queue_key, @processing_key] ++
@@ -574,7 +716,10 @@ defmodule Dispatch.Coordinator.JobStore do
             Integer.to_string(entry.ttl)
           ]
         end) ++
-        [normalize_field_for_storage(worker_version)]
+        [
+          normalize_field_for_storage(worker_version),
+          normalize_field_for_storage(worker_instance_id)
+        ]
 
     case transition(@claim_queued_script, keys, args) do
       {:ok, ["ok"]} ->
@@ -610,13 +755,15 @@ defmodule Dispatch.Coordinator.JobStore do
              started_at,
              attrs["status"],
              attrs["result"] || "",
-             attrs["error"] || "",
+             Observability.sanitize_error(attrs["error"]) || "",
              now_iso8601(),
              normalize_worker_name(attrs["worker_name"]),
              normalize_non_negative_integer(attrs["rate_limit_wait_ms"]),
              normalize_integer_for_storage(attrs["exit_code"]),
-             normalize_field_for_storage(attrs["logs_tail"]),
-             normalize_field_for_storage(attrs["worker_version"])
+             normalize_field_for_storage(Observability.sanitize_logs_tail(attrs["logs_tail"])),
+             normalize_field_for_storage(attrs["worker_version"]),
+             normalize_field_for_storage(attrs["failure_category"]),
+             cancellation_acknowledged_at(attrs)
            ]
          ) do
       {:ok, "ok"} -> {:ok, :completed}
@@ -656,9 +803,10 @@ defmodule Dispatch.Coordinator.JobStore do
     case transition(
            @interrupt_script,
            [job_key(job_id), @processing_key, @queue_key],
-           [job_id, started_at, reason]
+           [job_id, started_at, now_iso8601(), Observability.sanitize_error(reason)]
          ) do
       {:ok, "ok"} -> {:ok, :interrupted}
+      {:ok, "worker_lost"} -> {:ok, :worker_lost}
       {:ok, "not_found"} -> {:error, :not_found}
       {:ok, "stale_attempt"} -> {:error, :stale_attempt}
       {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
@@ -673,6 +821,20 @@ defmodule Dispatch.Coordinator.JobStore do
            [job_id, started_at, now_iso8601()]
          ) do
       {:ok, "ok"} -> {:ok, :requeued}
+      {:ok, "not_found"} -> {:error, :not_found}
+      {:ok, "stale_attempt"} -> {:error, :stale_attempt}
+      {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def mark_worker_lost(job_id, started_at, reason \\ "worker heartbeat lease expired") do
+    case transition(
+           @mark_worker_lost_script,
+           [job_key(job_id), @processing_key],
+           [job_id, started_at, now_iso8601(), Observability.sanitize_error(reason)]
+         ) do
+      {:ok, "ok"} -> {:ok, :worker_lost}
       {:ok, "not_found"} -> {:error, :not_found}
       {:ok, "stale_attempt"} -> {:error, :stale_attempt}
       {:ok, <<"invalid_transition:", _::binary>>} -> {:error, :invalid_transition}
@@ -705,18 +867,31 @@ defmodule Dispatch.Coordinator.JobStore do
       rate_limit_wait_ms: normalize_integer_field(fields["rate_limit_wait_ms"]),
       resources: decode_json_field(fields["resources"]),
       worker_resources: decode_json_field(fields["worker_resources"]),
+      submitted_at: normalize_field(fields["inserted_at"]),
       started_at: normalize_field(fields["started_at"]),
       heartbeat_at: normalize_field(fields["heartbeat_at"]),
       finished_at: normalize_field(fields["finished_at"]),
+      attempt: normalize_integer_field(fields["attempt"]) || 0,
+      recovery_count: normalize_integer_field(fields["recovery_count"]) || 0,
       dagster_run_id: normalize_field(fields["dagster_run_id"]),
+      dagster_job_name: normalize_field(fields["dagster_job_name"]),
+      dagster_code_location: normalize_field(fields["dagster_code_location"]),
       command: decode_json_field(fields["command"]),
       image: normalize_field(fields["image"]),
+      deployment_revision: normalize_field(fields["deployment_revision"]),
       metadata: decode_json_field(fields["metadata"]),
+      log_location: normalize_field(fields["log_location"]),
       exit_code: normalize_integer_field(fields["exit_code"]),
       logs_tail: normalize_field(fields["logs_tail"]),
+      failure_category: normalize_field(fields["failure_category"]),
       worker_version: normalize_field(fields["worker_version"]),
+      worker_instance_id: normalize_field(fields["worker_instance_id"]),
+      last_worker_name: normalize_field(fields["last_worker_name"]),
+      last_worker_instance_id: normalize_field(fields["last_worker_instance_id"]),
+      last_worker_lost_at: normalize_field(fields["last_worker_lost_at"]),
       cancel_requested: fields["cancel_requested"] == "1",
       cancel_requested_at: normalize_field(fields["cancel_requested_at"]),
+      cancellation_acknowledged_at: normalize_field(fields["cancellation_acknowledged_at"]),
       group_id: normalize_field(fields["group_id"]),
       queued_reason: normalize_field(fields["queued_reason"]),
       queue_wait_ms: duration_ms(fields["inserted_at"], fields["started_at"]),
@@ -782,6 +957,9 @@ defmodule Dispatch.Coordinator.JobStore do
   end
 
   defp normalize_integer_field(_value), do: nil
+
+  defp cancellation_acknowledged_at(%{"status" => "canceled"}), do: now_iso8601()
+  defp cancellation_acknowledged_at(_attrs), do: ""
 
   defp decode_json_field(value) when is_binary(value) and value != "" do
     case Jason.decode(value) do

@@ -1,6 +1,8 @@
 defmodule Dispatch.Worker.Executor do
   @moduledoc false
 
+  alias Dispatch.Observability
+
   @dagster_cancel_check_interval_ms 500
   @dagster_cancel_timeout_ms 5_000
   @default_dagster_run_timeout_seconds 21_600
@@ -77,25 +79,24 @@ defmodule Dispatch.Worker.Executor do
   defp execute_dagster_command(executable, args, env, opts) do
     command = [executable | args]
     resolved_executable = System.find_executable(executable) || executable
+    {port_executable, port_args} = process_group_command(resolved_executable, args)
     env = Enum.map(env, fn {key, value} -> {to_charlist(key), to_charlist(to_string(value))} end)
 
     port =
-      Port.open({:spawn_executable, resolved_executable}, [
+      Port.open({:spawn_executable, port_executable}, [
         :binary,
         :exit_status,
         :stderr_to_stdout,
-        args: args,
+        args: port_args,
         env: env
       ])
 
+    schedule_attempt_check(port, opts)
     wait_for_port(port, command, opts, "", System.monotonic_time(:millisecond))
   end
 
   defp wait_for_port(port, command, opts, logs_tail, started_at_ms) do
     cancel_check = Keyword.get(opts, :cancel_check, fn -> false end)
-
-    cancel_interval_ms =
-      Keyword.get(opts, :cancel_check_interval_ms, @dagster_cancel_check_interval_ms)
 
     receive do
       {^port, {:data, data}} ->
@@ -103,8 +104,8 @@ defmodule Dispatch.Worker.Executor do
 
       {^port, {:exit_status, exit_code}} ->
         dagster_result(exit_code, logs_tail)
-    after
-      cancel_interval_ms ->
+
+      {:dispatch_attempt_check, ^port} ->
         cond do
           execution_timed_out?(opts, started_at_ms) ->
             timeout_port(port, command, opts, logs_tail)
@@ -113,6 +114,7 @@ defmodule Dispatch.Worker.Executor do
             cancel_port(port, command, opts, logs_tail)
 
           true ->
+            schedule_attempt_check(port, opts)
             wait_for_port(port, command, opts, logs_tail, started_at_ms)
         end
     end
@@ -128,18 +130,19 @@ defmodule Dispatch.Worker.Executor do
     os_pid = port_os_pid(port)
 
     terminate_os_process(os_pid, :graceful)
-    wait_for_timed_out_port(port, command, os_pid, timeout_ms, logs_tail)
+    Process.send_after(self(), {:dispatch_timeout_force_kill, port}, timeout_ms)
+    wait_for_timed_out_port(port, command, os_pid, logs_tail)
   end
 
-  defp wait_for_timed_out_port(port, command, os_pid, timeout_ms, logs_tail) do
+  defp wait_for_timed_out_port(port, command, os_pid, logs_tail) do
     receive do
       {^port, {:data, data}} ->
-        wait_for_timed_out_port(port, command, os_pid, timeout_ms, append_tail(logs_tail, data))
+        wait_for_timed_out_port(port, command, os_pid, append_tail(logs_tail, data))
 
       {^port, {:exit_status, exit_code}} ->
         timed_out_result(exit_code, logs_tail)
-    after
-      timeout_ms ->
+
+      {:dispatch_timeout_force_kill, ^port} ->
         terminate_os_process(os_pid, :force)
         timed_out_result(nil, logs_tail)
     end
@@ -150,21 +153,30 @@ defmodule Dispatch.Worker.Executor do
     os_pid = port_os_pid(port)
 
     terminate_os_process(os_pid, :graceful)
-    wait_for_canceled_port(port, command, os_pid, timeout_ms, logs_tail)
+    Process.send_after(self(), {:dispatch_cancel_force_kill, port}, timeout_ms)
+    wait_for_canceled_port(port, command, os_pid, logs_tail)
   end
 
-  defp wait_for_canceled_port(port, command, os_pid, timeout_ms, logs_tail) do
+  defp wait_for_canceled_port(port, command, os_pid, logs_tail) do
     receive do
       {^port, {:data, data}} ->
-        wait_for_canceled_port(port, command, os_pid, timeout_ms, append_tail(logs_tail, data))
+        wait_for_canceled_port(port, command, os_pid, append_tail(logs_tail, data))
 
       {^port, {:exit_status, exit_code}} ->
         canceled_result(exit_code, logs_tail)
-    after
-      timeout_ms ->
+
+      {:dispatch_cancel_force_kill, ^port} ->
         terminate_os_process(os_pid, :force)
         canceled_result(nil, logs_tail)
     end
+  end
+
+  defp schedule_attempt_check(port, opts) do
+    Process.send_after(
+      self(),
+      {:dispatch_attempt_check, port},
+      Keyword.get(opts, :cancel_check_interval_ms, @dagster_cancel_check_interval_ms)
+    )
   end
 
   defp port_os_pid(port) do
@@ -187,7 +199,7 @@ defmodule Dispatch.Worker.Executor do
       System.cmd("taskkill", args, stderr_to_stdout: true)
     else
       signal = if mode == :force, do: "-KILL", else: "-TERM"
-      System.cmd("kill", [signal, Integer.to_string(pid)], stderr_to_stdout: true)
+      System.cmd("kill", [signal, "--", "-#{pid}"], stderr_to_stdout: true)
     end
 
     :ok
@@ -201,7 +213,8 @@ defmodule Dispatch.Worker.Executor do
       "result" => nil,
       "error" => nil,
       "exit_code" => 0,
-      "logs_tail" => empty_to_nil(logs_tail)
+      "logs_tail" => sanitized_logs_tail(logs_tail),
+      "failure_category" => nil
     }
   end
 
@@ -211,7 +224,8 @@ defmodule Dispatch.Worker.Executor do
       "result" => nil,
       "error" => "dagster_run command exited with code #{exit_code}",
       "exit_code" => exit_code,
-      "logs_tail" => empty_to_nil(logs_tail)
+      "logs_tail" => sanitized_logs_tail(logs_tail),
+      "failure_category" => "process_exit_nonzero"
     }
   end
 
@@ -221,7 +235,8 @@ defmodule Dispatch.Worker.Executor do
       "result" => nil,
       "error" => "dagster_run canceled",
       "exit_code" => exit_code,
-      "logs_tail" => empty_to_nil(logs_tail)
+      "logs_tail" => sanitized_logs_tail(logs_tail),
+      "failure_category" => "canceled"
     }
   end
 
@@ -231,7 +246,8 @@ defmodule Dispatch.Worker.Executor do
       "result" => nil,
       "error" => "dagster_run exceeded execution timeout",
       "exit_code" => exit_code,
-      "logs_tail" => empty_to_nil(logs_tail)
+      "logs_tail" => sanitized_logs_tail(logs_tail),
+      "failure_category" => "timeout"
     }
   end
 
@@ -306,12 +322,29 @@ defmodule Dispatch.Worker.Executor do
     }
   end
 
-  defp failed_result(error) do
+  defp failed_result(error, failure_category \\ "executor_error") do
     %{
       "status" => "failed",
       "result" => nil,
-      "error" => error
+      "error" => Observability.sanitize_error(error),
+      "failure_category" => failure_category
     }
+  end
+
+  defp sanitized_logs_tail(value) do
+    value
+    |> empty_to_nil()
+    |> Observability.sanitize_logs_tail()
+  end
+
+  defp process_group_command(executable, args) do
+    case {:os.type(), System.find_executable("setsid")} do
+      {{:unix, _name}, setsid} when is_binary(setsid) ->
+        {setsid, ["--", executable | args]}
+
+      _ ->
+        {executable, args}
+    end
   end
 
   defp empty_to_nil(value) when is_binary(value) do

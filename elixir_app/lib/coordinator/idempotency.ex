@@ -43,5 +43,15 @@ defmodule Dispatch.Coordinator.Idempotency do
     command.(["EVAL", script, "1", redis_key, job_id])
   end
 
+  def lookup(scope, key, opts \\ []) do
+    command = Keyword.get(opts, :command, &Redix.command(@redis_name, &1))
+
+    case command.(["GET", redis_key(scope, key)]) do
+      {:ok, job_id} when is_binary(job_id) and job_id != "" -> {:ok, job_id}
+      {:ok, _value} -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   defp redis_key(scope, key), do: "idempotency:#{scope}:#{key}"
 end

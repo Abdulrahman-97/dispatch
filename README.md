@@ -21,6 +21,8 @@ coordinator.
 ## What It Does
 
 - `POST /jobs` queues a job
+- `GET /jobs/by-dagster-run/:run_id` finds the unique full-run job by its
+  Dagster idempotency key
 - `POST /jobs/:id/cancel` cancels a queued job or requests cancellation for a running job
 - `POST /job-groups` queues a batch of normal jobs and returns one group id
 - `POST /internal/poll` lets a worker atomically claim a job
@@ -82,6 +84,7 @@ Response:
   "result": "...",
   "error": "...",
   "worker_name": "worker-1",
+  "worker_instance_id": "container-or-instance-id",
   "resources": {
     "api_slots": 1,
     "memory_slots": 1
@@ -97,15 +100,26 @@ Response:
   },
   "rate_limit_wait_ms": 1000,
   "dagster_run_id": "dagster-run-id",
+  "dagster_job_name": "daily_prices",
+  "dagster_code_location": "stocks",
   "command": ["dagster", "api", "execute_run"],
   "image": "optional-image-or-version",
+  "deployment_revision": "immutable-image-or-code-revision",
   "metadata": {
     "dagster_job_name": "daily_prices"
   },
   "exit_code": 0,
   "logs_tail": "...",
+  "log_location": "s3://bucket/prefix/storage/run-id/compute_logs",
+  "failure_category": null,
   "worker_version": "0.1.0",
+  "attempt": 1,
+  "recovery_count": 0,
+  "submitted_at": "2026-05-02T10:00:00Z",
+  "heartbeat_at": "2026-05-02T10:00:10Z",
   "cancel_requested": false,
+  "cancel_requested_at": null,
+  "cancellation_acknowledged_at": null,
   "group_id": "uuid",
   "queued_reason": "group_concurrency_limit:uuid",
   "queue_wait_ms": 2000,
@@ -219,9 +233,14 @@ Reliability behavior:
 - completed jobs are removed from `jobs:processing` with `LREM`
 - job hashes include `inserted_at`, `started_at`, and `finished_at`
 - running and completed jobs include `worker_name` when claimed by a modern worker
+- attempts include worker instance/revision, attempt number, and current heartbeat
 - the coordinator periodically requeues stuck `running` jobs after `DISPATCH_JOB_STUCK_AFTER_SECONDS`
+- full `dagster_run` jobs are not automatically requeued after lease loss because
+  the old process may still be alive; they enter `worker_lost` and require
+  reconciliation
 - stale worker results are rejected if a job was already recovered and restarted
 - `dagster_run` submissions are idempotent by `dagster_run_id`
+- an existing full-run job is directly lookupable by `dagster_run_id`
 - queued jobs can be canceled directly; running jobs receive a cooperative cancellation request
 
 The queue-to-processing move is atomic without blocking the coordinator HTTP request. If a worker
@@ -249,6 +268,10 @@ WORKER_NAME=worker-1
 WORKER_CONCURRENCY=5
 DISPATCH_WORKER_RESOURCES_JSON={"cpu_slots":4,"memory_slots":8,"api_slots":50,"io_slots":10}
 WORKER_POLL_INTERVAL_MS=1000
+DISPATCH_HEARTBEAT_LOG_INTERVAL_MS=60000
+DISPATCH_RESULT_REPORT_MAX_ATTEMPTS=5
+DISPATCH_RESULT_REPORT_RETRY_BASE_MS=250
+DISPATCH_WORKER_VERSION=<immutable-worker-revision>
 PYTHON_ROOT=/app/python
 PYTHON_BIN=/opt/dispatch-python/bin/python
 ```
@@ -418,6 +441,8 @@ Behavior:
   payload is stored in Redis.
 - Re-submitting the same `dagster_run_id` returns the existing Dispatch `job_id` instead of creating
   a duplicate job.
+- `GET /jobs/by-dagster-run/:dagster_run_id` recovers correlation after a lost
+  submission response or failed client metadata write.
 - `GET /jobs/:id` exposes `dagster_run_id`, `command`, `image`, `metadata`, `exit_code`,
   `logs_tail`, `worker_name`, and `worker_version`.
 
@@ -434,6 +459,14 @@ Responses:
   reports `status: "canceled"`
 - terminal job: `200` with `cancellation: "already_terminal"`
 - missing job: `404`
+
+Linux workers start full Dagster commands in a separate process group. They
+send `TERM` to the group and use `KILL` after a bounded grace period. This is
+process cancellation, not rollback of external side effects.
+
+Lifecycle logs are bounded JSON and include the Dagster run id, Dispatch job
+id, attempt, worker name/instance/revision, and timestamps as they become
+known. Secret-like values, bearer tokens, and credentialed URLs are redacted.
 
 Operational requirements for a Dagster RunLauncher:
 

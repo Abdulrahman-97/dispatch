@@ -21,12 +21,18 @@ defmodule Dispatch.Coordinator.DagsterRun do
   def validate_params(_params), do: {:error, "params must be a JSON object"}
 
   def attrs(params) do
+    metadata = params["metadata"] || %{}
+
     %{
       "dagster_run_id" => params["dagster_run_id"],
       "idempotency_key" => params["dagster_run_id"],
       "command" => Jason.encode!(params["command"]),
       "image" => params["image"] || "",
-      "metadata" => Jason.encode!(params["metadata"] || %{})
+      "metadata" => Jason.encode!(metadata),
+      "dagster_job_name" => normalize_metadata_field(metadata["dagster_job_name"]),
+      "dagster_code_location" => normalize_metadata_field(metadata["dagster_code_location"]),
+      "deployment_revision" => normalize_metadata_field(metadata["deployment_revision"]),
+      "log_location" => normalize_metadata_field(metadata["log_location"])
     }
   end
 
@@ -83,4 +89,7 @@ defmodule Dispatch.Coordinator.DagsterRun do
 
   defp metadata(metadata) when is_map(metadata), do: {:ok, metadata}
   defp metadata(_metadata), do: {:error, "metadata must be a JSON object"}
+
+  defp normalize_metadata_field(value) when is_binary(value), do: String.trim(value)
+  defp normalize_metadata_field(_value), do: ""
 end

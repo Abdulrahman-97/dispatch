@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     util-linux \
   && command -v setsid >/dev/null \
   && command -v kill >/dev/null \
+  && command -v pgrep >/dev/null \
   && rm -rf /var/lib/apt/lists/*
 
 ARG PYTHON_PACKAGE_SPEC=""

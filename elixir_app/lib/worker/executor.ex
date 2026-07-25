@@ -137,7 +137,7 @@ defmodule Dispatch.Worker.Executor do
 
   defp timeout_port(port, command, opts, logs_tail) do
     timeout_ms = Keyword.get(opts, :cancel_timeout_ms, @dagster_cancel_timeout_ms)
-    os_pid = port_os_pid(port)
+    os_pid = port |> port_os_pid() |> signal_target_pid()
 
     _graceful_signal = signal_process(os_pid, :graceful, opts)
     Process.send_after(self(), {:dispatch_timeout_force_kill, port}, timeout_ms)
@@ -159,7 +159,7 @@ defmodule Dispatch.Worker.Executor do
 
   defp cancel_port(port, command, opts, logs_tail) do
     timeout_ms = Keyword.get(opts, :cancel_timeout_ms, @dagster_cancel_timeout_ms)
-    os_pid = port_os_pid(port)
+    os_pid = port |> port_os_pid() |> signal_target_pid()
 
     _graceful_signal = signal_process(os_pid, :graceful, opts)
     Process.send_after(self(), {:dispatch_cancel_force_kill, port}, timeout_ms)
@@ -238,12 +238,48 @@ defmodule Dispatch.Worker.Executor do
     end
   end
 
+  defp signal_target_pid(nil), do: nil
+
+  defp signal_target_pid(port_pid) do
+    if match?({:unix, _name}, :os.type()) do
+      child_process_id(port_pid)
+    else
+      port_pid
+    end
+  end
+
+  defp child_process_id(parent_pid) do
+    pgrep = System.find_executable("pgrep") || "pgrep"
+
+    case System.cmd(
+           pgrep,
+           ["-P", Integer.to_string(parent_pid)],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        output
+        |> String.split()
+        |> Enum.find_value(fn value ->
+          case Integer.parse(value) do
+            {pid, ""} when pid > 0 -> pid
+            _ -> nil
+          end
+        end)
+
+      {_output, _exit_code} ->
+        nil
+    end
+  rescue
+    _exception -> nil
+  end
+
   defp signal_process(pid, mode, opts) do
     signaler = Keyword.get(opts, :terminate_process, &terminate_os_process/2)
     signaler.(pid, mode)
   end
 
-  defp terminate_os_process(nil, _mode), do: {:error, "OS process id unavailable"}
+  defp terminate_os_process(nil, _mode),
+    do: {:error, "process-group id unavailable"}
 
   defp terminate_os_process(pid, mode) do
     {command, args} =
@@ -438,12 +474,13 @@ defmodule Dispatch.Worker.Executor do
     case :os.type() do
       {:unix, _name} ->
         with setsid when is_binary(setsid) <- System.find_executable("setsid"),
-             kill when is_binary(kill) <- System.find_executable("kill") do
-          {:ok, {setsid, ["--", executable | args]}}
+             kill when is_binary(kill) <- System.find_executable("kill"),
+             pgrep when is_binary(pgrep) <- System.find_executable("pgrep") do
+          {:ok, {setsid, ["--fork", "--wait", "--", executable | args]}}
         else
           nil ->
             {:error,
-             "setsid and kill are required for process-group-aware Dagster execution on Unix"}
+             "setsid, kill, and pgrep are required for process-group-aware Dagster execution on Unix"}
         end
 
       _ ->

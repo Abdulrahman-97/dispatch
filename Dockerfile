@@ -4,10 +4,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     git \
+    procps \
     python3 \
     python3-venv \
     python-is-python3 \
     util-linux \
+  && command -v setsid >/dev/null \
+  && command -v kill >/dev/null \
   && rm -rf /var/lib/apt/lists/*
 
 ARG PYTHON_PACKAGE_SPEC=""

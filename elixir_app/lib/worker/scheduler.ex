@@ -89,7 +89,8 @@ defmodule Dispatch.Worker.Scheduler do
       |> Map.merge(%{
         status: result["status"],
         exit_code: result["exit_code"],
-        failure_category: result["failure_category"]
+        failure_category: result["failure_category"],
+        error: result["error"]
       })
     )
 

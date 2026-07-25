@@ -367,6 +367,40 @@ defmodule ElixirAppTest do
     assert result["failure_category"] == "canceled"
   end
 
+  test "dagster_run cancellation allows graceful leader cleanup before force kill" do
+    command =
+      if match?({:win32, _name}, :os.type()) do
+        "import time; print('ready', flush=True); time.sleep(5)"
+      else
+        "import signal,sys,time; " <>
+          "signal.signal(signal.SIGTERM, " <>
+          "lambda *_: sys.exit(print('graceful-cleanup', flush=True))); " <>
+          "print('ready', flush=True); time.sleep(5)"
+      end
+
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-graceful-cancel",
+            "command" => [python_executable(), "-c", command],
+            "env" => %{}
+          }
+        },
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 100,
+        cancel_timeout_ms: 500
+      )
+
+    assert result["status"] == "canceled"
+    assert result["failure_category"] == "canceled"
+
+    if match?({:unix, _name}, :os.type()) do
+      assert result["logs_tail"] =~ "graceful-cleanup"
+    end
+  end
+
   test "dagster_run execution timeout terminates command and returns failed status" do
     result =
       Dispatch.Worker.Executor.run(

@@ -257,7 +257,7 @@ defmodule Dispatch.Worker.Executor do
         {"taskkill", taskkill_args}
       else
         signal = if mode == :force, do: "-KILL", else: "-TERM"
-        {"kill", [signal, "--", "-#{pid}"]}
+        {System.find_executable("kill") || "kill", [signal, "--", "-#{pid}"]}
       end
 
     case System.cmd(command, args, stderr_to_stdout: true) do
@@ -437,12 +437,13 @@ defmodule Dispatch.Worker.Executor do
   defp process_group_command(executable, args) do
     case :os.type() do
       {:unix, _name} ->
-        case System.find_executable("setsid") do
-          setsid when is_binary(setsid) ->
-            {:ok, {setsid, ["--", executable | args]}}
-
+        with setsid when is_binary(setsid) <- System.find_executable("setsid"),
+             kill when is_binary(kill) <- System.find_executable("kill") do
+          {:ok, {setsid, ["--", executable | args]}}
+        else
           nil ->
-            {:error, "setsid is required for process-group-aware Dagster execution on Unix"}
+            {:error,
+             "setsid and kill are required for process-group-aware Dagster execution on Unix"}
         end
 
       _ ->

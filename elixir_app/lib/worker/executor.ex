@@ -293,7 +293,8 @@ defmodule Dispatch.Worker.Executor do
         {"taskkill", taskkill_args}
       else
         signal = if mode == :force, do: "-KILL", else: "-TERM"
-        {System.find_executable("kill") || "kill", [signal, "--", "-#{pid}"]}
+        target = if mode == :force, do: "-#{pid}", else: Integer.to_string(pid)
+        {System.find_executable("kill") || "kill", [signal, "--", target]}
       end
 
     case System.cmd(command, args, stderr_to_stdout: true) do

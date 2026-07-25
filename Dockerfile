@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-venv \
     python-is-python3 \
+    util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 ARG PYTHON_PACKAGE_SPEC=""

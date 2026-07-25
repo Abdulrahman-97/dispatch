@@ -419,6 +419,77 @@ defmodule ElixirAppTest do
     assert duration_ms < 2_000
   end
 
+  test "dagster_run cancellation kills descendant processes before reporting canceled" do
+    marker_path =
+      Path.join(
+        System.tmp_dir!(),
+        "dispatch-cancel-marker-#{System.unique_integer([:positive])}"
+      )
+
+    child =
+      "import os,time; time.sleep(1); " <>
+        "open(os.environ['DISPATCH_TEST_MARKER'], 'w').write('still-running')"
+
+    parent =
+      if match?({:win32, _name}, :os.type()) do
+        "import subprocess,sys,time; " <>
+          "subprocess.Popen([sys.executable, '-c', #{inspect(child)}]); time.sleep(5)"
+      else
+        "import signal,subprocess,sys,time; " <>
+          "signal.signal(signal.SIGTERM, signal.SIG_IGN); " <>
+          "subprocess.Popen([sys.executable, '-c', #{inspect(child)}]); time.sleep(5)"
+      end
+
+    try do
+      result =
+        Dispatch.Worker.Executor.run(
+          %{
+            "job_type" => "dagster_run",
+            "params" => %{
+              "dagster_run_id" => "run-descendant-cancel",
+              "command" => [python_executable(), "-c", parent],
+              "env" => %{"DISPATCH_TEST_MARKER" => marker_path}
+            }
+          },
+          cancel_check: fn -> true end,
+          cancel_check_interval_ms: 100,
+          cancel_timeout_ms: 100,
+          force_kill_timeout_ms: 500
+        )
+
+      assert result["status"] == "canceled"
+      assert result["failure_category"] == "canceled"
+      Process.sleep(1_250)
+      refute File.exists?(marker_path)
+    after
+      File.rm(marker_path)
+    end
+  end
+
+  test "dagster_run never reports canceled before process exit is confirmed" do
+    result =
+      Dispatch.Worker.Executor.run(
+        %{
+          "job_type" => "dagster_run",
+          "params" => %{
+            "dagster_run_id" => "run-unconfirmed-cancel",
+            "command" => [python_executable(), "-c", "import time; time.sleep(0.5)"],
+            "env" => %{}
+          }
+        },
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 10,
+        cancel_timeout_ms: 10,
+        force_kill_timeout_ms: 25,
+        terminate_process: fn _pid, _mode -> :ok end
+      )
+
+    assert result["status"] == "failed"
+    assert result["failure_category"] == "cancellation_termination_unconfirmed"
+    assert result["error"] =~ "could not confirm process exit"
+    Process.sleep(550)
+  end
+
   test "dagster_run cancellation is not starved by continuous output" do
     started_at = System.monotonic_time(:millisecond)
 

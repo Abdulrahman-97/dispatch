@@ -8,6 +8,25 @@ defmodule Dispatch.Worker.Executor do
   @dagster_force_kill_verify_timeout_ms 5_000
   @default_dagster_run_timeout_seconds 21_600
   @logs_tail_bytes 16_384
+  @dagster_status_probe """
+  import json
+  import signal
+  import sys
+
+  from dagster import DagsterInstance
+
+  run_id = sys.argv[1]
+  if hasattr(signal, "SIGALRM"):
+      signal.alarm(30)
+  with DagsterInstance.get() as instance:
+      run = instance.get_run_by_id(run_id)
+
+  if run is None:
+      print(json.dumps({"error": "Dagster run was not found"}))
+      raise SystemExit(2)
+
+  print(json.dumps({"status": run.status.value}))
+  """
   @runner """
   import json
   import subprocess
@@ -66,6 +85,7 @@ defmodule Dispatch.Worker.Executor do
         executable,
         args,
         env,
+        params,
         Keyword.put_new(opts, :execution_timeout_ms, timeout_ms)
       )
     else
@@ -77,7 +97,7 @@ defmodule Dispatch.Worker.Executor do
     kind, reason -> failed_result("dagster_run executor #{kind}: #{inspect(reason)}")
   end
 
-  defp execute_dagster_command(executable, args, env, opts) do
+  defp execute_dagster_command(executable, args, env, params, opts) do
     command = [executable | args]
     resolved_executable = System.find_executable(executable) || executable
 
@@ -98,22 +118,47 @@ defmodule Dispatch.Worker.Executor do
           ])
 
         schedule_attempt_check(port, opts)
-        wait_for_port(port, command, opts, "", System.monotonic_time(:millisecond))
+
+        wait_for_port(
+          port,
+          command,
+          env,
+          params,
+          opts,
+          "",
+          System.monotonic_time(:millisecond)
+        )
 
       {:error, reason} ->
         failed_result(reason, "process_group_unavailable")
     end
   end
 
-  defp wait_for_port(port, command, opts, logs_tail, started_at_ms) do
+  defp wait_for_port(
+         port,
+         command,
+         env,
+         params,
+         opts,
+         logs_tail,
+         started_at_ms
+       ) do
     cancel_check = Keyword.get(opts, :cancel_check, fn -> false end)
 
     receive do
       {^port, {:data, data}} ->
-        wait_for_port(port, command, opts, append_tail(logs_tail, data), started_at_ms)
+        wait_for_port(
+          port,
+          command,
+          env,
+          params,
+          opts,
+          append_tail(logs_tail, data),
+          started_at_ms
+        )
 
       {^port, {:exit_status, exit_code}} ->
-        dagster_result(exit_code, logs_tail)
+        dagster_result(exit_code, logs_tail, command, env, params, opts)
 
       {:dispatch_attempt_check, ^port} ->
         cond do
@@ -125,7 +170,16 @@ defmodule Dispatch.Worker.Executor do
 
           true ->
             schedule_attempt_check(port, opts)
-            wait_for_port(port, command, opts, logs_tail, started_at_ms)
+
+            wait_for_port(
+              port,
+              command,
+              env,
+              params,
+              opts,
+              logs_tail,
+              started_at_ms
+            )
         end
     end
   end
@@ -150,7 +204,13 @@ defmodule Dispatch.Worker.Executor do
         wait_for_timed_out_port(port, command, os_pid, append_tail(logs_tail, data), opts)
 
       {^port, {:exit_status, exit_code}} ->
-        timed_out_result(exit_code, logs_tail)
+        termination_after_port_exit(
+          :timeout,
+          os_pid,
+          exit_code,
+          logs_tail,
+          opts
+        )
 
       {:dispatch_timeout_force_kill, ^port} ->
         force_kill_and_verify(port, command, os_pid, logs_tail, opts, :timeout)
@@ -172,7 +232,13 @@ defmodule Dispatch.Worker.Executor do
         wait_for_canceled_port(port, command, os_pid, append_tail(logs_tail, data), opts)
 
       {^port, {:exit_status, exit_code}} ->
-        canceled_result(exit_code, logs_tail)
+        termination_after_port_exit(
+          :cancellation,
+          os_pid,
+          exit_code,
+          logs_tail,
+          opts
+        )
 
       {:dispatch_cancel_force_kill, ^port} ->
         force_kill_and_verify(port, command, os_pid, logs_tail, opts, :cancellation)
@@ -198,28 +264,149 @@ defmodule Dispatch.Worker.Executor do
     wait_for_force_killed_port(
       port,
       command,
+      os_pid,
       logs_tail,
       outcome,
-      force_signal
+      force_signal,
+      opts
     )
   end
 
-  defp wait_for_force_killed_port(port, command, logs_tail, outcome, force_signal) do
+  defp wait_for_force_killed_port(
+         port,
+         command,
+         os_pid,
+         logs_tail,
+         outcome,
+         force_signal,
+         opts
+       ) do
     receive do
       {^port, {:data, data}} ->
         wait_for_force_killed_port(
           port,
           command,
+          os_pid,
           append_tail(logs_tail, data),
           outcome,
-          force_signal
+          force_signal,
+          opts
         )
 
       {^port, {:exit_status, exit_code}} ->
-        termination_result(outcome, exit_code, logs_tail)
+        termination_after_port_exit(
+          outcome,
+          os_pid,
+          exit_code,
+          logs_tail,
+          opts,
+          force_signal
+        )
 
       {:dispatch_force_kill_verification_timeout, ^port, ^outcome} ->
         unconfirmed_termination_result(outcome, force_signal, logs_tail)
+    end
+  end
+
+  defp termination_after_port_exit(
+         outcome,
+         os_pid,
+         exit_code,
+         logs_tail,
+         opts,
+         force_signal \\ nil
+       ) do
+    case process_group_status(os_pid, opts) do
+      :terminated ->
+        termination_result(outcome, exit_code, logs_tail)
+
+      :alive ->
+        force_signal = force_signal || signal_process(os_pid, :force, opts)
+
+        verify_process_group_terminated(
+          outcome,
+          os_pid,
+          exit_code,
+          logs_tail,
+          force_signal,
+          opts
+        )
+
+      {:error, reason} ->
+        unconfirmed_termination_result(
+          outcome,
+          {:error, "process-group verification failed: #{reason}"},
+          logs_tail
+        )
+    end
+  end
+
+  defp verify_process_group_terminated(
+         outcome,
+         os_pid,
+         exit_code,
+         logs_tail,
+         force_signal,
+         opts
+       ) do
+    timeout_ms =
+      Keyword.get(opts, :force_kill_timeout_ms, @dagster_force_kill_verify_timeout_ms)
+
+    poll_interval_ms = Keyword.get(opts, :termination_poll_interval_ms, 25)
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+
+    verify_process_group_terminated_until(
+      outcome,
+      os_pid,
+      exit_code,
+      logs_tail,
+      force_signal,
+      opts,
+      deadline_ms,
+      poll_interval_ms
+    )
+  end
+
+  defp verify_process_group_terminated_until(
+         outcome,
+         os_pid,
+         exit_code,
+         logs_tail,
+         force_signal,
+         opts,
+         deadline_ms,
+         poll_interval_ms
+       ) do
+    case process_group_status(os_pid, opts) do
+      :terminated ->
+        termination_result(outcome, exit_code, logs_tail)
+
+      :alive ->
+        if System.monotonic_time(:millisecond) < deadline_ms do
+          receive do
+          after
+            poll_interval_ms ->
+              verify_process_group_terminated_until(
+                outcome,
+                os_pid,
+                exit_code,
+                logs_tail,
+                force_signal,
+                opts,
+                deadline_ms,
+                poll_interval_ms
+              )
+          end
+        else
+          unconfirmed_termination_result(outcome, force_signal, logs_tail)
+        end
+
+      {:error, reason} ->
+        unconfirmed_termination_result(
+          outcome,
+          {:error, "process-group verification failed: #{reason}"},
+          logs_tail
+        )
     end
   end
 
@@ -278,6 +465,44 @@ defmodule Dispatch.Worker.Executor do
     signaler.(pid, mode)
   end
 
+  defp process_group_status(pid, opts) do
+    checker = Keyword.get(opts, :process_group_status, &os_process_group_status/1)
+    checker.(pid)
+  end
+
+  defp os_process_group_status(nil),
+    do: {:error, "process-group id unavailable"}
+
+  defp os_process_group_status(pid) do
+    if match?({:win32, _name}, :os.type()) do
+      case System.cmd(
+             "tasklist",
+             ["/FI", "PID eq #{pid}", "/NH"],
+             stderr_to_stdout: true
+           ) do
+        {output, 0} ->
+          if String.contains?(output, Integer.to_string(pid)), do: :alive, else: :terminated
+
+        {output, exit_code} ->
+          {:error, "tasklist exited with code #{exit_code}: #{String.trim(output)}"}
+      end
+    else
+      kill = System.find_executable("kill") || "kill"
+
+      case System.cmd(
+             kill,
+             ["-0", "--", "-#{pid}"],
+             stderr_to_stdout: true
+           ) do
+        {_output, 0} -> :alive
+        {_output, _exit_code} -> :terminated
+      end
+    end
+  rescue
+    exception ->
+      {:error, "process-group check failed: #{Exception.message(exception)}"}
+  end
+
   defp terminate_os_process(nil, _mode),
     do: {:error, "process-group id unavailable"}
 
@@ -293,7 +518,7 @@ defmodule Dispatch.Worker.Executor do
         {"taskkill", taskkill_args}
       else
         signal = if mode == :force, do: "-KILL", else: "-TERM"
-        target = if mode == :force, do: "-#{pid}", else: Integer.to_string(pid)
+        target = "-#{pid}"
         {System.find_executable("kill") || "kill", [signal, "--", target]}
       end
 
@@ -313,7 +538,47 @@ defmodule Dispatch.Worker.Executor do
        Observability.sanitize_error("signal command failed: #{Exception.message(exception)}")}
   end
 
-  defp dagster_result(0, logs_tail) do
+  defp dagster_result(0, logs_tail, command, env, params, opts) do
+    case authoritative_dagster_status(command, env, params, opts) do
+      {:ok, "SUCCESS"} ->
+        successful_dagster_result(logs_tail)
+
+      {:ok, "FAILURE"} ->
+        logical_dagster_failure("FAILURE", logs_tail)
+
+      {:ok, "CANCELED"} ->
+        canceled_result(0, logs_tail)
+
+      {:ok, status} ->
+        logical_dagster_failure(status, logs_tail, "logical_state_not_terminal")
+
+      :not_applicable ->
+        successful_dagster_result(logs_tail)
+
+      {:error, reason} ->
+        %{
+          "status" => "failed",
+          "result" => nil,
+          "error" => Observability.sanitize_error("Dagster status check failed: #{reason}"),
+          "exit_code" => 0,
+          "logs_tail" => sanitized_logs_tail(logs_tail),
+          "failure_category" => "logical_state_check_failed"
+        }
+    end
+  end
+
+  defp dagster_result(exit_code, logs_tail, _command, _env, _params, _opts) do
+    %{
+      "status" => "failed",
+      "result" => nil,
+      "error" => "dagster_run command exited with code #{exit_code}",
+      "exit_code" => exit_code,
+      "logs_tail" => sanitized_logs_tail(logs_tail),
+      "failure_category" => "process_exit_nonzero"
+    }
+  end
+
+  defp successful_dagster_result(logs_tail) do
     %{
       "status" => "success",
       "result" => nil,
@@ -324,15 +589,94 @@ defmodule Dispatch.Worker.Executor do
     }
   end
 
-  defp dagster_result(exit_code, logs_tail) do
+  defp logical_dagster_failure(status, logs_tail, category \\ "logical_run_failure") do
     %{
       "status" => "failed",
       "result" => nil,
-      "error" => "dagster_run command exited with code #{exit_code}",
-      "exit_code" => exit_code,
+      "error" => "Dagster run reached logical status #{status}",
+      "exit_code" => 0,
       "logs_tail" => sanitized_logs_tail(logs_tail),
-      "failure_category" => "process_exit_nonzero"
+      "failure_category" => category
     }
+  end
+
+  defp authoritative_dagster_status(command, env, params, opts) do
+    case Keyword.get(opts, :dagster_status_check) do
+      nil -> default_dagster_status_check(command, env, params)
+      checker -> checker.(command, env, params)
+    end
+  end
+
+  defp default_dagster_status_check(command, env, params) do
+    case dagster_python_executable(command) do
+      {:ok, executable} ->
+        resolved_executable = System.find_executable(executable) || executable
+        run_id = Map.fetch!(params, "dagster_run_id")
+
+        command_env =
+          Enum.map(env, fn {key, value} ->
+            {to_string(key), to_string(value)}
+          end)
+
+        case System.cmd(
+               resolved_executable,
+               ["-c", @dagster_status_probe, run_id],
+               env: command_env,
+               stderr_to_stdout: true
+             ) do
+          {output, 0} ->
+            parse_dagster_status_probe(output)
+
+          {output, exit_code} ->
+            {:error, "status probe exited with code #{exit_code}: #{String.trim(output)}"}
+        end
+
+      :not_applicable ->
+        :not_applicable
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    exception -> {:error, "status probe failed: #{Exception.message(exception)}"}
+  end
+
+  defp dagster_python_executable([
+         executable,
+         "-m",
+         "dagster",
+         "api",
+         "execute_run" | _
+       ]),
+       do: {:ok, executable}
+
+  defp dagster_python_executable([executable, "api", "execute_run" | _]) do
+    if executable |> Path.basename() |> String.starts_with?("dagster") do
+      case System.find_executable("python") || System.find_executable("python3") do
+        nil -> {:error, "Python executable is unavailable for Dagster status verification"}
+        python -> {:ok, python}
+      end
+    else
+      :not_applicable
+    end
+  end
+
+  defp dagster_python_executable(_command), do: :not_applicable
+
+  defp parse_dagster_status_probe(output) do
+    response =
+      output
+      |> String.split("\n", trim: true)
+      |> List.last()
+      |> to_string()
+
+    with {:ok, payload} <- Jason.decode(response),
+         status when is_binary(status) and status != "" <- payload["status"] do
+      {:ok, String.upcase(status)}
+    else
+      {:ok, %{"error" => reason}} when is_binary(reason) -> {:error, reason}
+      _ -> {:error, "status probe returned an invalid response"}
+    end
   end
 
   defp canceled_result(exit_code, logs_tail) do

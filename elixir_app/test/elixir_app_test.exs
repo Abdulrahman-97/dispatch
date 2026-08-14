@@ -346,6 +346,67 @@ defmodule ElixirAppTest do
     assert result["failure_category"] == nil
   end
 
+  test "dagster_run uses authoritative logical success instead of exit code alone" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("logical-success"),
+        dagster_status_check: fn _command, _env, _params -> {:ok, "SUCCESS"} end
+      )
+
+    assert result["status"] == "success"
+    assert result["exit_code"] == 0
+    assert result["failure_category"] == nil
+  end
+
+  test "dagster_run maps logical failure even when the command exits zero" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("logical-failure"),
+        dagster_status_check: fn _command, _env, _params -> {:ok, "FAILURE"} end
+      )
+
+    assert result["status"] == "failed"
+    assert result["exit_code"] == 0
+    assert result["failure_category"] == "logical_run_failure"
+    assert result["error"] =~ "logical status FAILURE"
+  end
+
+  test "dagster_run maps authoritative logical cancellation" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("logical-canceled"),
+        dagster_status_check: fn _command, _env, _params -> {:ok, "CANCELED"} end
+      )
+
+    assert result["status"] == "canceled"
+    assert result["failure_category"] == "canceled"
+  end
+
+  test "dagster_run fails closed when logical state remains nonterminal" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("logical-running"),
+        dagster_status_check: fn _command, _env, _params -> {:ok, "STARTED"} end
+      )
+
+    assert result["status"] == "failed"
+    assert result["failure_category"] == "logical_state_not_terminal"
+  end
+
+  test "dagster_run fails closed when the authoritative status lookup fails" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("logical-lookup-failure"),
+        dagster_status_check: fn _command, _env, _params ->
+          {:error, "control store unavailable"}
+        end
+      )
+
+    assert result["status"] == "failed"
+    assert result["failure_category"] == "logical_state_check_failed"
+    assert result["error"] =~ "control store unavailable"
+  end
+
   test "running dagster_run cancellation terminates command and returns canceled status" do
     result =
       Dispatch.Worker.Executor.run(
@@ -365,6 +426,34 @@ defmodule ElixirAppTest do
     assert result["status"] == "canceled"
     assert result["error"] == "dagster_run canceled"
     assert result["failure_category"] == "canceled"
+  end
+
+  test "dagster_run that already exited is not relabeled by a late cancel check" do
+    result =
+      Dispatch.Worker.Executor.run(
+        dagster_command_job("already-exited"),
+        cancel_check: fn -> true end,
+        cancel_check_interval_ms: 250
+      )
+
+    assert result["status"] == "success"
+    assert result["failure_category"] == nil
+  end
+
+  test "repeated cancellation remains idempotent after terminal cancellation" do
+    terminal = {:ok, ["terminal", "canceled"]}
+
+    assert Dispatch.Coordinator.JobStore.cancel_transition_result({:ok, ["canceled"]}) ==
+             {:ok, :canceled}
+
+    assert Dispatch.Coordinator.JobStore.cancel_transition_result({:ok, ["cancel_requested"]}) ==
+             {:ok, :cancel_requested}
+
+    assert Dispatch.Coordinator.JobStore.cancel_transition_result(terminal) ==
+             {:ok, {:already_terminal, "canceled"}}
+
+    assert Dispatch.Coordinator.JobStore.cancel_transition_result(terminal) ==
+             {:ok, {:already_terminal, "canceled"}}
   end
 
   test "dagster_run cancellation allows graceful leader cleanup before force kill" do
@@ -497,6 +586,49 @@ defmodule ElixirAppTest do
       refute File.exists?(marker_path)
     after
       File.rm(marker_path)
+    end
+  end
+
+  test "dagster_run force kills a surviving child after its leader exits gracefully" do
+    if match?({:unix, _name}, :os.type()) do
+      marker_path =
+        Path.join(
+          System.tmp_dir!(),
+          "dispatch-surviving-child-marker-#{System.unique_integer([:positive])}"
+        )
+
+      child =
+        "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); " <>
+          "time.sleep(1); open(os.environ['DISPATCH_TEST_MARKER'], 'w').write('alive')"
+
+      parent =
+        "import signal,subprocess,sys,time; " <>
+          "subprocess.Popen([sys.executable, '-c', #{inspect(child)}]); " <>
+          "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(5)"
+
+      try do
+        result =
+          Dispatch.Worker.Executor.run(
+            %{
+              "job_type" => "dagster_run",
+              "params" => %{
+                "dagster_run_id" => "run-surviving-child",
+                "command" => [python_executable(), "-c", parent],
+                "env" => %{"DISPATCH_TEST_MARKER" => marker_path}
+              }
+            },
+            cancel_check: fn -> true end,
+            cancel_check_interval_ms: 100,
+            cancel_timeout_ms: 500,
+            force_kill_timeout_ms: 500
+          )
+
+        assert result["status"] == "canceled"
+        assert result["failure_category"] == "canceled"
+        refute File.exists?(marker_path)
+      after
+        File.rm(marker_path)
+      end
     end
   end
 
@@ -834,5 +966,16 @@ defmodule ElixirAppTest do
 
   defp python_executable do
     System.find_executable("python") || System.find_executable("python3") || "python"
+  end
+
+  defp dagster_command_job(run_id) do
+    %{
+      "job_type" => "dagster_run",
+      "params" => %{
+        "dagster_run_id" => run_id,
+        "command" => [python_executable(), "-c", "raise SystemExit(0)"],
+        "env" => %{}
+      }
+    }
   end
 end

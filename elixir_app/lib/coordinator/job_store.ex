@@ -786,11 +786,17 @@ defmodule Dispatch.Coordinator.JobStore do
   end
 
   def cancel(job_id, reason \\ "canceled by request") do
-    case transition(@cancel_script, [job_key(job_id), @queue_key], [
-           job_id,
-           now_iso8601(),
-           reason
-         ]) do
+    transition(@cancel_script, [job_key(job_id), @queue_key], [
+      job_id,
+      now_iso8601(),
+      reason
+    ])
+    |> cancel_transition_result()
+  end
+
+  @doc false
+  def cancel_transition_result(result) do
+    case result do
       {:ok, ["canceled"]} -> {:ok, :canceled}
       {:ok, ["cancel_requested"]} -> {:ok, :cancel_requested}
       {:ok, ["terminal", status]} -> {:ok, {:already_terminal, status}}

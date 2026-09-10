@@ -1,0 +1,41 @@
+name: Verify published lifecycle artifacts
+on:
+  push:
+    branches: [codex/lifecycle-pull-verification-20260911]
+permissions:
+  contents: read
+  packages: read
+jobs:
+  independent-pull:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull reviewed artifacts on fresh non-builder runner
+        shell: python
+        run: |
+          import subprocess,json,pathlib
+          rows=[
+           ('ghcr.io/abdulrahman-97/dispatch-core-worker@sha256:ef566f11e14d42502cc293f015cc34eb4d5eadb2617220a2dc10de28ce7093ee','sha256:7d4da61758dae455118365acaf29d0889bf6c634445d3310313a32b93eac6adb'),
+           ('ghcr.io/abdulrahman-97/dagster-stocks-runtime@sha256:eb7d6b572908abc4c4985093fbfcd0cda47dfd94f19f841764a0a68521300d4a','sha256:88c2ab0453feafc326e2b7c5b41a84ccc8385b1f54f0dfd6d4eb9294efa0d93a'),
+           ('ghcr.io/abdulrahman-97/dagster-stocks@sha256:5ecb2f6e5633993880abec1c4d708de3e3a53484d8feb4e2d9b40efc91f02d62','sha256:955834f4345d630f4068d90a9d4e10a46dd19da1c9d515a8c7e53b156f4b29c5')]
+          evidence=[]
+          for ref,expected in rows:
+            subprocess.run(['docker','pull','--platform','linux/amd64',ref],check=True)
+            d=json.loads(subprocess.check_output(['docker','image','inspect',ref]))[0]
+            assert d['Id']==expected,(ref,d['Id'])
+            assert (d['Os'],d['Architecture'])==('linux','amd64')
+            evidence.append({'reference':ref,'config_id':d['Id'],'platform':d['Os']+'/'+d['Architecture'],'repo_digests':d['RepoDigests'],'layers':d['RootFS']['Layers']})
+          assert evidence[1]['layers'][:len(evidence[0]['layers'])]==evidence[0]['layers']
+          pathlib.Path('independent-pull.json').write_text(json.dumps(evidence,indent=2))
+          print('Three immutable artifacts match reviewed config IDs; derived core layers match. No images built or deployed.')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: independent-pull-${{ github.sha }}
+          path: independent-pull.json
+          retention-days: 30

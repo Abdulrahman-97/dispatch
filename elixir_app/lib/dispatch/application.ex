@@ -15,13 +15,42 @@ defmodule Dispatch.Application do
           [redis_child(), recovery_child(), coordinator_child()]
 
         "worker" ->
-          [{Dispatch.Worker.Scheduler, []}]
+          [{Task.Supervisor, name: Dispatch.Worker.Tasks}, {Dispatch.Worker.Scheduler, []}]
 
         _ ->
           []
       end
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: Dispatch.Supervisor)
+    # Losing scheduler state must not silently restore capacity beside old tasks.
+    # A worker supervision failure stops the application; coordinator attempts
+    # remain unresolved. Coordinator supervision retains its existing policy.
+    options =
+      if role() == "worker",
+        do: [strategy: :one_for_all, max_restarts: 0, name: Dispatch.Supervisor],
+        else: [strategy: :one_for_one, name: Dispatch.Supervisor]
+
+    Supervisor.start_link(children, options)
+  end
+
+  # OTP calls prep_stop before stopping the application's supervision tree.
+  # Scheduler and executor tasks remain alive, including their heartbeats.
+  @impl true
+  def prep_stop(state) do
+    if role() == "worker" do
+      if Process.whereis(Dispatch.Worker.Scheduler) do
+        Dispatch.Worker.Scheduler.drain()
+      else
+        Dispatch.Observability.event(
+          "worker_drain_unavailable",
+          %{
+            outcome: "scheduler ownership lost; coordinator reconciliation required"
+          },
+          :error
+        )
+      end
+    end
+
+    state
   end
 
   defp coordinator_child do

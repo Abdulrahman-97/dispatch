@@ -160,13 +160,15 @@ defmodule Dispatch.Coordinator.JobStore do
     return "not_found"
   end
 
-  if status ~= "running" and status ~= "worker_lost" then
-    return "invalid_transition:" .. status
-  end
-
   if redis.call("HGET", key, "started_at") ~= ARGV[2] then
     return "stale_attempt"
   end
+  local receipt = cjson.encode({ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12]})
+  if status ~= "running" and status ~= "worker_lost" then
+    if redis.call("HGET", key, "completion_receipt") == receipt then return "ok" end
+    return "invalid_transition:" .. status
+  end
+  redis.call("HSET", key, "completion_receipt", receipt)
 
   redis.call(
     "HSET",
@@ -532,6 +534,38 @@ defmodule Dispatch.Coordinator.JobStore do
   return "skipped"
   """
 
+  @reconcile_terminal_script """
+  local key = KEYS[1]
+  if redis.call("HGET", key, "job_type") ~= "dagster_run" or
+     redis.call("HGET", key, "dagster_run_id") ~= ARGV[2] then return "identity_mismatch" end
+  if redis.call("HGET", key, "terminal_dagster_status") == ARGV[3] and
+     redis.call("HGET", key, "status") == "canceled" and
+     redis.call("HGET", key, "attempt") == "0" then return "reconciled" end
+  if redis.call("HGET", key, "status") ~= "queued" or
+     redis.call("HGET", key, "attempt") ~= "0" or
+     (redis.call("HGET", key, "started_at") or "") ~= "" or
+     (redis.call("HGET", key, "heartbeat_at") or "") ~= "" or
+     (redis.call("HGET", key, "worker_name") or "") ~= "" or
+     (redis.call("HGET", key, "recovery_count") or "0") ~= "0" or
+     (redis.call("HGET", key, "worker_instance_id") or "") ~= "" or
+     redis.call("LPOS", KEYS[3], ARGV[1]) then return "retained" end
+  redis.call("LREM", KEYS[2], 0, ARGV[1])
+  redis.call("HSET", key, "status", "canceled", "terminal_dagster_status", ARGV[3],
+    "terminal_observed_at", ARGV[4], "finished_at", ARGV[4],
+    "failure_category", "terminal_before_assignment", "queued_reason", "terminal_before_assignment")
+  return "reconciled"
+  """
+
+  def reconcile_terminal(job_id, run_id, status)
+      when status in ["SUCCESS", "FAILURE", "CANCELED"] do
+    transition(@reconcile_terminal_script, [job_key(job_id), @queue_key, @processing_key], [
+      job_id,
+      run_id,
+      status,
+      now_iso8601()
+    ])
+  end
+
   def put_new(job_id, payload_json, attrs \\ %{}) do
     Redix.command(@redis_name, [
       "HSET",
@@ -786,11 +820,17 @@ defmodule Dispatch.Coordinator.JobStore do
   end
 
   def cancel(job_id, reason \\ "canceled by request") do
-    case transition(@cancel_script, [job_key(job_id), @queue_key], [
-           job_id,
-           now_iso8601(),
-           reason
-         ]) do
+    transition(@cancel_script, [job_key(job_id), @queue_key], [
+      job_id,
+      now_iso8601(),
+      reason
+    ])
+    |> cancel_transition_result()
+  end
+
+  @doc false
+  def cancel_transition_result(result) do
+    case result do
       {:ok, ["canceled"]} -> {:ok, :canceled}
       {:ok, ["cancel_requested"]} -> {:ok, :cancel_requested}
       {:ok, ["terminal", status]} -> {:ok, {:already_terminal, status}}

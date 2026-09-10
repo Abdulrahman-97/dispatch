@@ -1,0 +1,12 @@
+# Disposable CI fixture only; never published or used as a production core.
+FROM elixir:1.19.1-otp-28
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python-is-python3 procps util-linux ca-certificates && rm -rf /var/lib/apt/lists/*
+ENV MIX_ENV=prod APP_ROLE=none
+WORKDIR /app/elixir_app
+RUN mix local.hex --force && mix local.rebar --force
+COPY elixir_app/mix.exs elixir_app/mix.lock ./
+RUN mix deps.get --only prod && mix deps.compile
+COPY elixir_app/lib ./lib
+COPY elixir_app/.formatter.exs ./
+COPY python /app/python
+RUN mix compile --warnings-as-errors

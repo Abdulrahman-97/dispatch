@@ -1,0 +1,33 @@
+name: Lifecycle disposable tests
+on:
+  pull_request:
+  push:
+    branches: ["codex/dispatch-lifecycle-ci-20260910"]
+permissions:
+  contents: read
+jobs:
+  linux-lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build isolated test fixture (no publish or registry login)
+        run: |
+          docker build -f scripts/Dockerfile.lifecycle-ci -t lifecycle-test:local .
+          docker pull redis@sha256:6aaf3f5e6bc8a592fbfe2cccf19eb36d27c39d12dab4f4b01556b7449e7b1f44
+          echo "DISPATCH_TEST_IMAGE_ID=$(docker image inspect --format '{{.Id}}' lifecycle-test:local)" >> "$GITHUB_ENV"
+          echo "DISPATCH_TEST_REDIS_ID=$(docker image inspect --format '{{.Id}}' redis@sha256:6aaf3f5e6bc8a592fbfe2cccf19eb36d27c39d12dab4f4b01556b7449e7b1f44)" >> "$GITHUB_ENV"
+          docker context create desktop-linux --docker host=unix:///var/run/docker.sock
+      - name: Format check
+        run: docker run --rm --network none --entrypoint mix -v "$PWD/elixir_app:/src:ro" -w /src "$DISPATCH_TEST_IMAGE_ID" format --check-formatted
+      - name: Real Redis coordinator suite
+        run: python3 scripts/verify_store_linux.py
+      - name: Real Linux signal and stop matrix (simulated remote HTTP)
+        run: python3 scripts/verify_lifecycle.py --context desktop-linux --output .local-evidence/linux-lifecycle.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lifecycle-${{ github.sha }}
+          path: .local-evidence/
+          include-hidden-files: true
+          retention-days: 30

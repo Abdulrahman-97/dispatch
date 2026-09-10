@@ -5,6 +5,7 @@ Both root filesystems are read-only, with bounded tmpfs; no credential mounts.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -26,6 +27,10 @@ def main():
         if result.returncode:
             raise RuntimeError(result.stderr)
         return result.stdout.strip()
+    global IMAGE
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        IMAGE = os.environ["DISPATCH_TEST_IMAGE_ID"]
+        assert IMAGE.startswith("sha256:")
     docker("image", "inspect", IMAGE)
     results = []
     for mode in ("sigterm", "docker_stop", "deadline", "kill", "docker_kill_deadline", "lost_ack", "heartbeat_recovery"):

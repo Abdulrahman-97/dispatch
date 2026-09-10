@@ -1,5 +1,6 @@
 """Real Linux Redis/HTTP/ExUnit, isolated namespace, no production configuration."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import uuid
@@ -16,6 +17,11 @@ def docker(*args, check=True):
         raise RuntimeError(result.stdout + result.stderr)
     return result
 
+
+if os.environ.get('GITHUB_ACTIONS') == 'true':
+    IMAGE = os.environ['DISPATCH_TEST_IMAGE_ID']
+    REDIS = os.environ['DISPATCH_TEST_REDIS_ID']
+    assert IMAGE.startswith('sha256:') and REDIS.startswith('sha256:')
 
 OUT.mkdir(exist_ok=True)
 name = 'lifecycle-redis-' + uuid.uuid4().hex[:10]

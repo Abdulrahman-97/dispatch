@@ -14,4 +14,6 @@ _tmp_python/
 Thumbs.db
 
 elixir_app/.elixir_ls/
+/.local-evidence/
+/.local-tools/
 

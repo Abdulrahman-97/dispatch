@@ -50,6 +50,22 @@ defmodule Dispatch.Coordinator.Router do
     end
   end
 
+  # Trusted Dagster control-plane assertion, subject to the existing API access boundary.
+  # This endpoint deliberately cannot cancel a claimed or previously attempted job.
+  post "/jobs/:job_id/reconcile-terminal" do
+    run_id = conn.body_params["dagster_run_id"]
+    status = conn.body_params["dagster_status"]
+
+    if is_binary(run_id) and run_id != "" and status in ["SUCCESS", "FAILURE", "CANCELED"] do
+      case JobStore.reconcile_terminal(job_id, run_id, status) do
+        {:ok, outcome} -> json(conn, 200, %{job_id: job_id, reconciliation: outcome})
+        {:error, reason} -> redis_error(conn, reason)
+      end
+    else
+      json(conn, 422, %{error: "exact run id and terminal Dagster status required"})
+    end
+  end
+
   post "/jobs/:job_id/cancel" do
     case JobStore.cancel(job_id) do
       {:ok, :canceled} ->

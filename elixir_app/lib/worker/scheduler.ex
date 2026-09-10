@@ -16,13 +16,19 @@ defmodule Dispatch.Worker.Scheduler do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  def drain do
+    grace = shutdown_grace_ms!()
+    deadline = System.monotonic_time(:millisecond) + grace
+    GenServer.call(__MODULE__, {:drain, deadline}, :infinity)
+  end
+
   def should_poll?(%{draining: true}), do: false
   def should_poll?(%{available: available}), do: any_available?(available)
 
   @impl true
   def init(_opts) do
     Process.flag(:trap_exit, true)
-    :os.set_signal(:sigterm, :handle)
+    _ = shutdown_grace_ms!()
 
     capacity = worker_capacity!()
 
@@ -35,7 +41,9 @@ defmodule Dispatch.Worker.Scheduler do
       worker_version: worker_version(),
       worker_instance_id: worker_instance_id(),
       running: %{},
-      draining: false
+      draining: false,
+      drain_waiter: nil,
+      pending_results: %{}
     }
 
     Observability.event("worker_started", %{
@@ -72,9 +80,6 @@ defmodule Dispatch.Worker.Scheduler do
   end
 
   def handle_info({:job_finished, job, requirements, result}, state) do
-    state = %{state | available: Resources.add(state.available, requirements, state.capacity)}
-    state = %{state | running: Map.delete(state.running, job["job_id"])}
-
     payload =
       result
       |> Map.put("job_id", job["job_id"])
@@ -95,46 +100,120 @@ defmodule Dispatch.Worker.Scheduler do
     )
 
     maybe_log_upload_completed(job, state, result)
-    report_result(state, job, payload)
+    # Ownership and capacity are retained until the exact result is acknowledged.
+    state = %{
+      state
+      | pending_results:
+          Map.put(state.pending_results, job["job_id"], {job, requirements, payload})
+    }
 
-    send(self(), :poll)
+    report_async(state, job, payload)
     {:noreply, state}
   end
 
-  def handle_info({:signal, :sigterm}, state) do
-    Observability.event(
-      "worker_shutdown_started",
-      %{
-        worker_name: state.worker_name,
-        worker_instance_id: state.worker_instance_id,
-        active_job_ids: Map.keys(state.running),
-        reason: "sigterm"
-      },
-      :warning
-    )
+  def handle_info({:result_ack, job_id, :ok}, state) do
+    {_, requirements, _} = Map.fetch!(state.pending_results, job_id)
 
-    {:noreply, %{state | draining: true}}
+    state = %{
+      state
+      | running: Map.delete(state.running, job_id),
+        pending_results: Map.delete(state.pending_results, job_id),
+        available: Resources.add(state.available, requirements, state.capacity)
+    }
+
+    if not is_nil(state.drain_waiter) and map_size(state.running) == 0 do
+      GenServer.reply(state.drain_waiter, :drained)
+      {:noreply, %{state | drain_waiter: nil}}
+    else
+      send(self(), :poll)
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:result_ack, job_id, _uncertain}, state) do
+    # This is a receipt retry, never a command retry. Keep the reservation.
+    Process.send_after(self(), {:retry_result, job_id}, 1000)
+    {:noreply, state}
+  end
+
+  def handle_info({:retry_result, job_id}, state) do
+    {job, _, payload} = Map.fetch!(state.pending_results, job_id)
+    report_async(state, job, payload)
+    {:noreply, state}
+  end
+
+  def handle_info(:drain_deadline, state) do
+    if state.drain_waiter do
+      Observability.event(
+        "worker_drain_deadline",
+        %{
+          active_job_ids: Map.keys(state.running),
+          outcome: "uncertain; remote commands may continue"
+        },
+        :error
+      )
+
+      GenServer.reply(state.drain_waiter, :uncertain)
+    end
+
+    {:noreply, %{state | drain_waiter: nil}}
+  end
+
+  @impl true
+  def handle_call({:drain, deadline}, from, state) do
+    # Serialized behind any already-issued poll: its accepted assignment belongs
+    # to this drain. No subsequent assignment request is issued after this ack.
+    Observability.event("worker_drain_acknowledged", %{
+      worker_instance_id: state.worker_instance_id,
+      active_job_ids: Map.keys(state.running),
+      deadline_ms: deadline
+    })
+
+    state = %{state | draining: true, drain_waiter: from}
+
+    if map_size(state.running) == 0 do
+      {:reply, :drained, %{state | drain_waiter: nil}}
+    else
+      Process.send_after(
+        self(),
+        :drain_deadline,
+        max(0, deadline - System.monotonic_time(:millisecond))
+      )
+
+      {:noreply, state}
+    end
+  end
+
+  defp report_async(state, job, payload) do
+    parent = self()
+
+    Task.Supervisor.start_child(Dispatch.Worker.Tasks, fn ->
+      _ = attempt_should_stop?(state, job)
+      send(parent, {:result_ack, job["job_id"], report_result(state, job, payload, 1)})
+    end)
   end
 
   @impl true
   def terminate(reason, state) do
-    Enum.each(state.running, fn {_job_id, job} ->
-      Observability.event(
-        "worker_shutdown_during_execution",
-        Map.put(correlation(job, state), :reason, inspect(reason)),
-        :warning
-      )
+    # Coordinator already retains each claimed job/attempt. SIGKILL may prevent
+    # this best-effort report; lease recovery keeps Dagster jobs non-retryable.
+    state.running
+    |> Task.async_stream(
+      fn {_job_id, job} ->
+        payload = %{
+          "job_id" => job["job_id"],
+          "started_at" => job["started_at"],
+          "reason" => "worker interrupted: #{inspect(reason)}; remote outcome unresolved"
+        }
 
-      payload = %{
-        "job_id" => job["job_id"],
-        "started_at" => job["started_at"],
-        "worker_name" => state.worker_name,
-        "worker_instance_id" => state.worker_instance_id,
-        "reason" => "worker interrupted: #{inspect(reason)}"
-      }
-
-      _ = post_json(state.coordinator_url, "/internal/interrupted", payload)
-    end)
+        Observability.event("worker_shutdown_during_execution", correlation(job, state), :warning)
+        post_json(state.coordinator_url, "/internal/interrupted", payload)
+      end,
+      timeout: 1000,
+      on_timeout: :kill_task,
+      max_concurrency: max(1, map_size(state.running))
+    )
+    |> Stream.run()
 
     :ok
   end
@@ -158,7 +237,7 @@ defmodule Dispatch.Worker.Scheduler do
           Observability.event("worker_assigned", correlation(job, state))
           parent = self()
 
-          Task.start(fn ->
+          Task.Supervisor.start_child(Dispatch.Worker.Tasks, fn ->
             Observability.event("process_started", correlation(job, state))
             send(parent, {:job_finished, job, requirements, safe_execute(job, state)})
           end)
@@ -267,7 +346,7 @@ defmodule Dispatch.Worker.Scheduler do
     end
   end
 
-  defp report_result(state, job, payload, attempt \\ 1) do
+  defp report_result(state, job, payload, attempt) do
     case post_json(state.coordinator_url, "/internal/result", payload) do
       {:ok, 204, _body} ->
         Observability.event(
@@ -293,30 +372,14 @@ defmodule Dispatch.Worker.Scheduler do
         :stale
 
       response ->
-        if attempt < result_report_max_attempts() do
-          Observability.event(
-            "result_reporting_retry",
-            correlation(job, state)
-            |> Map.merge(%{report_attempt: attempt, reason: inspect(response)}),
-            :warning
-          )
-
-          Process.sleep(result_report_retry_delay_ms(attempt))
-          report_result(state, job, payload, attempt + 1)
-        else
-          Observability.event(
-            "result_reporting_failed",
-            correlation(job, state)
-            |> Map.merge(%{
-              report_attempt: attempt,
-              reason: inspect(response),
-              final_status: payload["status"]
-            }),
-            :error
-          )
-
+        Observability.event(
+          "result_reporting_failed",
+          correlation(job, state)
+          |> Map.merge(%{reason: inspect(response), final_status: payload["status"]}),
           :error
-        end
+        )
+
+        :error
     end
   end
 
@@ -408,6 +471,12 @@ defmodule Dispatch.Worker.Scheduler do
     System.get_env("COORDINATOR_URL", "http://localhost:4000")
   end
 
+  defp shutdown_grace_ms! do
+    grace = System.get_env("DISPATCH_SHUTDOWN_GRACE_MS", "20000") |> String.to_integer()
+    if grace < 1, do: raise(ArgumentError, "shutdown grace must be positive")
+    grace
+  end
+
   defp poll_interval_ms do
     System.get_env("WORKER_POLL_INTERVAL_MS", "1000")
     |> String.to_integer()
@@ -416,21 +485,6 @@ defmodule Dispatch.Worker.Scheduler do
   defp heartbeat_log_interval_ms do
     System.get_env("DISPATCH_HEARTBEAT_LOG_INTERVAL_MS", "60000")
     |> String.to_integer()
-  end
-
-  defp result_report_max_attempts do
-    System.get_env("DISPATCH_RESULT_REPORT_MAX_ATTEMPTS", "5")
-    |> String.to_integer()
-    |> max(1)
-  end
-
-  defp result_report_retry_delay_ms(attempt) do
-    base_delay =
-      System.get_env("DISPATCH_RESULT_REPORT_RETRY_BASE_MS", "250")
-      |> String.to_integer()
-      |> max(1)
-
-    min(base_delay * Integer.pow(2, attempt - 1), 5_000)
   end
 
   defp worker_concurrency do
